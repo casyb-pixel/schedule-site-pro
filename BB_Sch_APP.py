@@ -21,8 +21,8 @@ try:
 except ImportError:
     COOKIE_MANAGER_AVAILABLE = False
 
-# --- 2. EMBEDDED LIBRARY (FALLBACK) ---
-# This ensures your dropdowns are NEVER empty, even if the database is wiped.
+# --- 2. MASTER LIBRARY (The "Source of Truth") ---
+# This list replaces your CSV file. It is safer because it lives inside the code.
 MASTER_LIBRARY = [
     # PRE-CONSTRUCTION
     ("Pre-Construction", "Obtain Permits & Approvals"),
@@ -40,17 +40,17 @@ MASTER_LIBRARY = [
     ("Foundation", "Install Rebar"),
     ("Foundation", "Pour Concrete Slab/Walls"),
     ("Foundation", "Waterproofing"),
-    # FRAMING / STRUCTURE
+    # STRUCTURE
     ("Structure", "First Floor Framing"),
     ("Structure", "Second Floor Framing"),
     ("Structure", "Roof Trusses & Sheathing"),
     ("Structure", "Install Windows & Exterior Doors"),
     ("Structure", "Steel Erection (Commercial)"),
-    # MEP ROUGH
+    # MEP
     ("MEP Rough-In", "Plumbing Rough-In"),
     ("MEP Rough-In", "Electrical Rough-In"),
     ("MEP Rough-In", "HVAC Ductwork"),
-    ("MEP Rough-In", "MEP Inspections"),
+    ("MEP Rough-In", "Low Voltage Wiring"),
     # INTERIOR
     ("Interiors", "Insulation Install"),
     ("Interiors", "Hang Drywall"),
@@ -115,36 +115,21 @@ def execute_statement(query, params=None):
         st.error(f"Database Error: {e}")
         return None
 
-# --- 5. SELF-HEALING DB INIT ---
-def init_and_repair_db():
+# --- 5. DB INIT (Safe) ---
+def init_db():
     with engine.begin() as conn:
-        # 1. Create Tables
-        conn.execute(text('''CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username TEXT UNIQUE, password TEXT, email TEXT, created_at TEXT, scheduler_status TEXT DEFAULT 'Trial')'''))
-        conn.execute(text('''CREATE TABLE IF NOT EXISTS projects (id SERIAL PRIMARY KEY, user_id INTEGER, name TEXT, client_name TEXT, start_date TEXT, status TEXT DEFAULT 'Planning')'''))
-        conn.execute(text('''CREATE TABLE IF NOT EXISTS subcontractors (id SERIAL PRIMARY KEY, user_id INTEGER, company_name TEXT, contact_name TEXT, trade TEXT)'''))
-        conn.execute(text('''CREATE TABLE IF NOT EXISTS delay_events (id SERIAL PRIMARY KEY, project_id INTEGER, reason TEXT, days_lost INTEGER, affected_task_ids TEXT, event_date TEXT, description TEXT)'''))
+        conn.execute(text("CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username TEXT UNIQUE, password TEXT, email TEXT, created_at TEXT, scheduler_status TEXT DEFAULT 'Trial')"))
+        conn.execute(text("CREATE TABLE IF NOT EXISTS projects (id SERIAL PRIMARY KEY, user_id INTEGER, name TEXT, client_name TEXT, start_date TEXT, status TEXT DEFAULT 'Planning')"))
+        conn.execute(text("CREATE TABLE IF NOT EXISTS subcontractors (id SERIAL PRIMARY KEY, user_id INTEGER, company_name TEXT, contact_name TEXT, trade TEXT)"))
+        conn.execute(text("CREATE TABLE IF NOT EXISTS delay_events (id SERIAL PRIMARY KEY, project_id INTEGER, reason TEXT, days_lost INTEGER, affected_task_ids TEXT, event_date TEXT, description TEXT)"))
+        conn.execute(text("CREATE TABLE IF NOT EXISTS task_library (id SERIAL PRIMARY KEY, contractor_type TEXT, phase TEXT, task_name TEXT)"))
+        conn.execute(text("CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, project_id INTEGER, phase TEXT, name TEXT, duration INTEGER, start_date_override TEXT, exposure TEXT DEFAULT 'Outdoor', material_lead_time INTEGER DEFAULT 0, inspection_required INTEGER DEFAULT 0, dependencies TEXT, subcontractor_id INTEGER)"))
         
-        # 2. Task Library (Create & Seed)
-        conn.execute(text('''CREATE TABLE IF NOT EXISTS task_library (id SERIAL PRIMARY KEY, contractor_type TEXT, phase TEXT, task_name TEXT)'''))
-        
-        # Check if library is empty
-        check_lib = conn.execute(text("SELECT COUNT(*) FROM task_library")).scalar()
-        if check_lib == 0:
-            print("Repairing Library...")
-            for phase, task in MASTER_LIBRARY:
-                conn.execute(text("INSERT INTO task_library (contractor_type, phase, task_name) VALUES ('All', :p, :t)"), {"p": phase, "t": task})
+        # Check for phase column
+        try: conn.execute(text("ALTER TABLE tasks ADD COLUMN phase TEXT"))
+        except: pass
 
-        # 3. Tasks Table (Create & Repair)
-        conn.execute(text('''CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, project_id INTEGER, name TEXT, duration INTEGER, start_date_override TEXT, exposure TEXT DEFAULT 'Outdoor', subcontractor_id INTEGER, dependencies TEXT)'''))
-        
-        # CRITICAL: Check for 'phase' column and add if missing (Migration)
-        try:
-            conn.execute(text("ALTER TABLE tasks ADD COLUMN phase TEXT"))
-            print("Migrated: Added 'phase' column to tasks.")
-        except:
-            pass # Column likely exists
-
-init_and_repair_db()
+init_db()
 
 # --- 6. LOGIC ---
 def calculate_schedule_dates(tasks_df, project_start_date_str):
@@ -160,8 +145,10 @@ def calculate_schedule_dates(tasks_df, project_start_date_str):
         except: t['dep_list'] = []
 
     changed = True
-    while changed:
+    iterations = 0
+    while changed and iterations < 100:
         changed = False
+        iterations += 1
         for t in tasks:
             if not t['dep_list']: new_start = t['early_start']
             else:
@@ -170,7 +157,7 @@ def calculate_schedule_dates(tasks_df, project_start_date_str):
                     if pred_id in task_map: pred_finishes.append(task_map[pred_id]['early_finish'])
                 new_start = max(pred_finishes) if pred_finishes else proj_start
             
-            if new_start > t['early_start']: # Only push forward
+            if new_start > t['early_start']:
                 t['early_start'] = new_start
                 t['early_finish'] = new_start + datetime.timedelta(days=t['duration'])
                 changed = True
@@ -210,17 +197,29 @@ def edit_task_popup(task_id, project_id, user_id):
 
     # --- SELECTORS ---
     lib_df = run_query("SELECT * FROM task_library")
-    phases = sorted(lib_df['phase'].unique().tolist()) if not lib_df.empty else ["General"]
+    phases = sorted(lib_df['phase'].unique().tolist()) if not lib_df.empty else []
     
+    if not phases:
+        st.error("⚠️ Task Library is empty! Go to Settings -> Scroll Down -> Click 'Force-Reload Task Library'")
+        return
+
     c_ph, c_tk = st.columns(2)
     
-    curr_ph_idx = phases.index(t_data['phase']) if t_data.get('phase') in phases else 0
+    curr_ph_idx = 0
+    if t_data.get('phase') in phases:
+        curr_ph_idx = phases.index(t_data['phase'])
+    
     sel_phase = c_ph.selectbox("Phase", ["Custom"] + phases, index=curr_ph_idx + 1)
     
-    avail_tasks = sorted(lib_df[lib_df['phase'] == sel_phase]['task_name'].unique().tolist()) if sel_phase != "Custom" else []
+    avail_tasks = []
+    if sel_phase != "Custom":
+        avail_tasks = sorted(lib_df[lib_df['phase'] == sel_phase]['task_name'].unique().tolist())
+    
     sel_task = c_tk.selectbox("Task", ["Custom"] + avail_tasks)
     
-    final_name_val = sel_task if sel_task != "Custom" else t_data['name']
+    final_name_val = t_data['name']
+    if sel_task != "Custom":
+        final_name_val = sel_task
 
     # --- FORM ---
     with st.form("task_f"):
@@ -235,7 +234,12 @@ def edit_task_popup(task_id, project_id, user_id):
         subs = run_query("SELECT id, company_name FROM subcontractors WHERE user_id=:u", {"u": user_id})
         sub_opts = {0: "Unassigned"}
         for _, s in subs.iterrows(): sub_opts[s['id']] = s['company_name']
-        sub_id = st.selectbox("Subcontractor", options=list(sub_opts.keys()), format_func=lambda x: sub_opts[x], index=list(sub_opts.keys()).index(t_data['subcontractor_id'] if t_data['subcontractor_id'] in sub_opts else 0))
+        
+        curr_sub_idx = 0
+        if t_data['subcontractor_id'] in sub_opts:
+            curr_sub_idx = list(sub_opts.keys()).index(t_data['subcontractor_id'])
+            
+        sub_id = st.selectbox("Subcontractor", options=list(sub_opts.keys()), format_func=lambda x: sub_opts[x], index=curr_sub_idx)
         
         # Deps
         all_t = run_query("SELECT id, name FROM tasks WHERE project_id=:pid", {"pid": project_id})
@@ -274,11 +278,13 @@ def delay_popup(project_id):
         date = st.date_input("Date", value=datetime.date.today())
         aff = st.multiselect("Affected Tasks", options=t_map.keys(), format_func=lambda x: t_map[x])
         if st.form_submit_button("Save Delay", type="primary"):
-            execute_statement("INSERT INTO delay_events (project_id, reason, days_lost, affected_task_ids, event_date) VALUES (:pid, :r, :d, :a, :date)",
-                {"pid": project_id, "r": reason, "d": days, "a": json.dumps(aff), "date": str(date)})
-            for tid in aff:
-                execute_statement("UPDATE tasks SET duration = duration + :d WHERE id=:tid", {"d": days, "tid": tid})
-            st.session_state.active_popup = None; st.rerun()
+            if aff:
+                execute_statement("INSERT INTO delay_events (project_id, reason, days_lost, affected_task_ids, event_date) VALUES (:pid, :r, :d, :a, :date)",
+                    {"pid": project_id, "r": reason, "d": days, "a": json.dumps(aff), "date": str(date)})
+                for tid in aff:
+                    execute_statement("UPDATE tasks SET duration = duration + :d WHERE id=:tid", {"d": days, "tid": tid})
+                st.session_state.active_popup = None; st.rerun()
+            else: st.error("Select tasks")
 
     st.caption("Recent Delays")
     delays = run_query("SELECT * FROM delay_events WHERE project_id=:pid ORDER BY event_date DESC", {"pid": project_id})
@@ -309,21 +315,21 @@ if not st.session_state.user_id:
     st.image("https://balanceandbuildconsulting.com/wp-content/uploads/2026/01/ScheduleSite-Pro-Logo.png", width=300)
     tab1, tab2 = st.tabs(["Login", "Signup"])
     with tab1:
-        if st.button("Login"): # Placeholder logic for simplicity in this snippet
-            u = st.text_input("User", key="l_u").strip()
-            p = st.text_input("Pass", key="l_p", type="password")
-            if u and p:
-                q = run_query("SELECT id, password FROM users WHERE LOWER(username)=:u", {"u": u.lower()})
-                if not q.empty and q.iloc[0]['password'] == p:
-                    st.session_state.user_id = int(q.iloc[0]['id'])
-                    if COOKIE_MANAGER_AVAILABLE: cm.set("bb_user", u)
-                    st.rerun()
+        u = st.text_input("User").strip()
+        p = st.text_input("Pass", type="password")
+        if st.button("Login"): 
+            q = run_query("SELECT id, password FROM users WHERE LOWER(username)=:u", {"u": u.lower()})
+            if not q.empty and q.iloc[0]['password'] == p:
+                st.session_state.user_id = int(q.iloc[0]['id'])
+                if COOKIE_MANAGER_AVAILABLE: cm.set("bb_user", u)
+                st.rerun()
+            else: st.error("Invalid")
     with tab2:
-        new_u = st.text_input("New User")
+        new_u = st.text_input("New User").strip()
         new_p = st.text_input("New Pass", type="password")
         if st.button("Sign Up"):
             execute_statement("INSERT INTO users (username, password, created_at) VALUES (:u, :p, :d)", {"u": new_u, "p": new_p, "d": str(datetime.date.today())})
-            st.success("Created! Login now.")
+            st.success("Created! Login.")
     st.stop()
 
 # --- APP CONTENT ---
@@ -332,15 +338,18 @@ with st.sidebar:
     if st.button("🏠 Dashboard"): st.session_state.page = "Dashboard"; st.session_state.active_popup=None
     if st.button("➕ New Project"): st.session_state.page = "New Project"
     if st.button("🗓️ Scheduler"): st.session_state.page = "Scheduler"; st.session_state.active_popup=None
+    if st.button("⚙️ Settings"): st.session_state.page = "Settings"
     if st.button("🚪 Logout"): 
         if COOKIE_MANAGER_AVAILABLE: cm.delete("bb_user")
         st.session_state.clear(); st.rerun()
 
 if st.session_state.page == "Dashboard":
-    st.title("Projects")
+    st.title("Command Center")
+    proj_count = run_query("SELECT COUNT(*) FROM projects WHERE user_id=:uid", {"uid": st.session_state.user_id}).iloc[0,0]
+    st.metric("Total Projects", proj_count)
+    st.subheader("Your Projects")
     projs = run_query("SELECT * FROM projects WHERE user_id=:u ORDER BY id DESC", {"u": st.session_state.user_id})
     if not projs.empty: st.dataframe(projs[['name', 'client_name', 'start_date']], use_container_width=True)
-    else: st.info("No projects yet.")
 
 elif st.session_state.page == "New Project":
     st.title("Create Project")
@@ -356,7 +365,6 @@ elif st.session_state.page == "Scheduler":
     if projs.empty: st.warning("Create a project first."); st.stop()
     
     c1, c2 = st.columns([3, 1])
-    pid = int(projs.iloc[0]['id']) # Default to first for simplicity in this snippet
     sel_p_name = c1.selectbox("Project", projs['name'])
     pid = int(projs[projs['name'] == sel_p_name].iloc[0]['id'])
     
@@ -397,16 +405,32 @@ elif st.session_state.page == "Scheduler":
         st.altair_chart(base, use_container_width=True)
         
         # Grid
-        gd = st.data_editor(tasks[['id', 'phase', 'name', 'start_date', 'end_date', 'duration']], hide_index=True, key="g", 
-                            disabled=["phase", "start_date", "end_date"], column_config={"id": None})
-        
-        # Grid Edit Trigger
-        # (Simplified: User clicks row or edits duration)
+        gd = st.data_editor(tasks[['id', 'phase', 'name', 'start_date', 'end_date', 'duration']], hide_index=True, key="g", disabled=["phase", "start_date", "end_date"])
         for i, row in gd.iterrows():
             orig = tasks[tasks['id'] == row['id']].iloc[0]
             if row['duration'] != orig['duration']:
                 execute_statement("UPDATE tasks SET duration=:d WHERE id=:id", {"d": row['duration'], "id": row['id']}); st.rerun()
 
-    # Popups
     if st.session_state.active_popup == 'add': edit_task_popup(None, pid, st.session_state.user_id)
     if st.session_state.active_popup == 'delay': delay_popup(pid)
+
+elif st.session_state.page == "Settings":
+    st.title("Settings")
+    user_data = run_query("SELECT company_name FROM users WHERE id=:uid", {"uid": st.session_state.user_id}).iloc[0]
+    
+    with st.form("set_f"):
+        st.subheader("Profile")
+        cn = st.text_input("Company", value=user_data['company_name'] if user_data['company_name'] else "")
+        if st.form_submit_button("Save"):
+            execute_statement("UPDATE users SET company_name=:n WHERE id=:u", {"n": cn, "u": st.session_state.user_id})
+            st.success("Saved!")
+
+    st.markdown("---")
+    st.subheader("Database Maintenance")
+    st.warning("Only use this if your Task/Phase dropdowns are empty.")
+    if st.button("🚀 Force-Reload Task Library"):
+        with engine.begin() as conn:
+            conn.execute(text("TRUNCATE TABLE task_library RESTART IDENTITY"))
+            for p, t in MASTER_LIBRARY:
+                conn.execute(text("INSERT INTO task_library (contractor_type, phase, task_name) VALUES ('All', :p, :t)"), {"p": p, "t": t})
+        st.success("Library Repopulated! Go back to Scheduler.")
