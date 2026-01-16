@@ -98,41 +98,75 @@ def execute_statement(query, params=None):
 
 def init_db():
     with engine.begin() as conn:
+        # USERS TABLE
         conn.execute(text('''CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT, email TEXT,
-            logo_data BLOB, company_name TEXT, company_address TEXT, company_phone TEXT, 
-            created_at TEXT, pbp_status TEXT DEFAULT 'Inactive', scheduler_status TEXT DEFAULT 'Inactive'
+            id SERIAL PRIMARY KEY, 
+            username TEXT UNIQUE, 
+            password TEXT, 
+            email TEXT,
+            logo_data BYTEA, 
+            company_name TEXT, 
+            company_address TEXT, 
+            company_phone TEXT, 
+            created_at TEXT, 
+            pbp_status TEXT DEFAULT 'Inactive', 
+            scheduler_status TEXT DEFAULT 'Inactive'
         )'''))
+        
+        # PROJECTS TABLE
         conn.execute(text('''CREATE TABLE IF NOT EXISTS projects (
-            id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, client_name TEXT,
-            start_date TEXT, status TEXT DEFAULT 'Planning'
+            id SERIAL PRIMARY KEY, 
+            user_id INTEGER, 
+            name TEXT, 
+            client_name TEXT,
+            start_date TEXT, 
+            status TEXT DEFAULT 'Planning'
         )'''))
         
         # TASKS TABLE
         conn.execute(text('''CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, duration INTEGER, 
+            id SERIAL PRIMARY KEY, 
+            project_id INTEGER, 
+            name TEXT, 
+            duration INTEGER, 
             start_date_override TEXT, 
-            exposure TEXT DEFAULT 'Outdoor', material_lead_time INTEGER DEFAULT 0, 
-            material_status TEXT DEFAULT 'Not Ordered', inspection_required INTEGER DEFAULT 0, 
-            dependencies TEXT, subcontractor_id INTEGER
+            exposure TEXT DEFAULT 'Outdoor', 
+            material_lead_time INTEGER DEFAULT 0, 
+            material_status TEXT DEFAULT 'Not Ordered', 
+            inspection_required INTEGER DEFAULT 0, 
+            dependencies TEXT, 
+            subcontractor_id INTEGER
         )'''))
         
         # SUBCONTRACTORS TABLE
         conn.execute(text('''CREATE TABLE IF NOT EXISTS subcontractors (
-            id INTEGER PRIMARY KEY, user_id INTEGER, 
-            company_name TEXT, contact_name TEXT, 
-            trade TEXT, phone TEXT, email TEXT
+            id SERIAL PRIMARY KEY, 
+            user_id INTEGER, 
+            company_name TEXT, 
+            contact_name TEXT, 
+            trade TEXT, 
+            phone TEXT, 
+            email TEXT
         )'''))
         
+        # WBS LIBRARY
         conn.execute(text('''CREATE TABLE IF NOT EXISTS wbs_library (
-            id INTEGER PRIMARY KEY, category TEXT, json_structure TEXT
+            id SERIAL PRIMARY KEY, 
+            category TEXT, 
+            json_structure TEXT
         )'''))
+        
+        # DELAY EVENTS
         conn.execute(text('''CREATE TABLE IF NOT EXISTS delay_events (
-            id INTEGER PRIMARY KEY, project_id INTEGER, reason TEXT,
-            days_lost INTEGER, affected_task_ids TEXT, event_date TEXT
+            id SERIAL PRIMARY KEY, 
+            project_id INTEGER, 
+            reason TEXT,
+            days_lost INTEGER, 
+            affected_task_ids TEXT, 
+            event_date TEXT
         )'''))
 
-        # MIGRATION: Ensure columns exist
+        # MIGRATION STEPS (Safe to keep these)
         try: conn.execute(text("ALTER TABLE tasks ADD COLUMN dependencies TEXT"))
         except: pass
         try: conn.execute(text("ALTER TABLE tasks ADD COLUMN subcontractor_id INTEGER"))
