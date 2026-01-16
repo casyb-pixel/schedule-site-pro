@@ -37,12 +37,15 @@ st.markdown("""
     }
     .card-title { color: #6c757d; font-size: 14px; font-weight: 600; text-transform: uppercase; margin-bottom: 5px; }
     .card-value { color: #2B588D; font-size: 24px; font-weight: bold; margin: 0; }
+    
+    /* Completion Date Banner */
     .completion-banner {
         background-color: #d1ecf1; border-color: #bee5eb; color: #0c5460;
         padding: 15px; border-radius: 8px; text-align: center;
         font-size: 1.2rem; font-weight: bold; margin-bottom: 20px;
         border: 1px solid #bee5eb;
     }
+
     .stButton button { background-color: #2B588D !important; color: white !important; border-radius: 6px; border: none; }
     .stButton button:hover { background-color: #1e3f66 !important; }
     </style>
@@ -80,8 +83,8 @@ def execute_statement(query, params=None):
 
 # --- ROBUST DB INIT (Safe Mode) ---
 def init_db():
-    # Only creating tables that might not exist. 
-    # NOTE: The reset_and_upload.py script handles the main Tasks/Library reset.
+    # Only creating tables that might not exist to prevent crashes.
+    # The actual reset was done by the script, but this protects against missing tables.
     with engine.begin() as conn:
         conn.execute(text('''CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY, username TEXT UNIQUE, password TEXT, email TEXT,
@@ -93,16 +96,25 @@ def init_db():
             id SERIAL PRIMARY KEY, user_id INTEGER, name TEXT, client_name TEXT,
             start_date TEXT, status TEXT DEFAULT 'Planning'
         )'''))
-        # Subcontractors
         conn.execute(text('''CREATE TABLE IF NOT EXISTS subcontractors (
             id SERIAL PRIMARY KEY, user_id INTEGER, company_name TEXT, 
             contact_name TEXT, trade TEXT, phone TEXT, email TEXT
         )'''))
-        # Delays
         conn.execute(text('''CREATE TABLE IF NOT EXISTS delay_events (
             id SERIAL PRIMARY KEY, project_id INTEGER, reason TEXT,
             days_lost INTEGER, affected_task_ids TEXT, event_date TEXT,
             description TEXT, photo_data BYTEA
+        )'''))
+        # Ensure task_library exists (Created by reset script, but just in case)
+        conn.execute(text('''CREATE TABLE IF NOT EXISTS task_library (
+            id SERIAL PRIMARY KEY, contractor_type TEXT, phase TEXT, task_name TEXT
+        )'''))
+        # Ensure tasks table exists with new schema
+        conn.execute(text('''CREATE TABLE IF NOT EXISTS tasks (
+            id SERIAL PRIMARY KEY, project_id INTEGER, phase TEXT, name TEXT, duration INTEGER, 
+            start_date_override TEXT, exposure TEXT DEFAULT 'Outdoor', 
+            material_lead_time INTEGER DEFAULT 0, inspection_required INTEGER DEFAULT 0, 
+            dependencies TEXT, subcontractor_id INTEGER
         )'''))
 
 init_db()
@@ -115,6 +127,7 @@ def calculate_schedule_dates(tasks_df, project_start_date_str):
     task_map = {t['id']: t for t in tasks}
     proj_start = datetime.datetime.strptime(project_start_date_str, '%Y-%m-%d').date()
     
+    # 1. Initialization
     for t in tasks:
         if t.get('start_date_override'):
              try:
@@ -133,13 +146,15 @@ def calculate_schedule_dates(tasks_df, project_start_date_str):
             else: t['dep_list'] = []
         except: t['dep_list'] = []
 
+    # 2. Forward Pass
     changed = True
     iterations = 0
     while changed and iterations < len(tasks) * 2:
         changed = False
         iterations += 1
         for t in tasks:
-            if not t['dep_list']: new_start = t['early_start']
+            if not t['dep_list']:
+                new_start = t['early_start']
             else:
                 pred_finishes = []
                 for pred_id in t['dep_list']:
@@ -152,10 +167,11 @@ def calculate_schedule_dates(tasks_df, project_start_date_str):
                 t['early_finish'] = new_start + datetime.timedelta(days=t['duration'])
                 changed = True
     
+    # 3. Finalize
     for t in tasks:
         t['start_date'] = t['early_start'].strftime('%Y-%m-%d')
         t['end_date'] = t['early_finish'].strftime('%Y-%m-%d')
-        t['is_critical'] = False # Re-calc simplified for now
+        t['is_critical'] = False 
 
     if tasks:
         max_finish = max(t['early_finish'] for t in tasks)
@@ -191,11 +207,11 @@ def edit_task_popup(task_id, project_id, user_id):
         if not t_query.empty:
             t_data = t_query.iloc[0]
     
-    # --- PHASE & TASK SELECTOR ---
-    st.markdown("#### 🏗️ Phase & Task")
+    # --- PHASE & TASK SELECTOR (Outside Form for Interactivity) ---
+    st.markdown("#### 🏗️ Phase & Task Selection")
     
     # Fetch Library
-    lib_df = run_query("SELECT * FROM task_library") # Gets everything (Shared Library)
+    lib_df = run_query("SELECT * FROM task_library")
     phases = []
     if not lib_df.empty:
         phases = sorted(lib_df['phase'].unique().tolist())
@@ -203,28 +219,30 @@ def edit_task_popup(task_id, project_id, user_id):
     c_ph, c_tk = st.columns(2)
     
     # 1. Select Phase
-    # Try to set default phase from existing task
+    # Default to current task phase if editing
     curr_phase_idx = 0
-    if t_data['phase'] in phases:
+    if t_data.get('phase') and t_data['phase'] in phases:
         curr_phase_idx = phases.index(t_data['phase'])
         
     sel_phase = c_ph.selectbox("Project Phase", ["Custom"] + phases, index=curr_phase_idx + 1 if phases else 0)
     
-    # 2. Select Task (Filtered)
+    # 2. Select Task (Filtered by Phase)
     avail_tasks = []
     if sel_phase != "Custom" and not lib_df.empty:
         avail_tasks = sorted(lib_df[lib_df['phase'] == sel_phase]['task_name'].unique().tolist())
         
-    sel_task = c_tk.selectbox("Task Name", ["Custom"] + avail_tasks)
+    sel_task = c_tk.selectbox("Standard Task", ["Custom"] + avail_tasks)
     
-    # Auto-Populate Name Logic
-    final_name_value = t_data['name']
+    # Auto-Populate Name Logic (Only if user selects a standard task)
+    final_name_val = t_data['name']
     if sel_task != "Custom":
-        final_name_value = sel_task # Use just the task name, Phase is stored separately now
+        final_name_val = sel_task
     
-    # --- FORM ---
+    # --- MAIN FORM ---
     with st.form("edit_form"):
-        new_name = st.text_input("Display Name", value=final_name_value)
+        st.markdown("---")
+        st.caption("Task Details")
+        new_name = st.text_input("Display Name", value=final_name_val)
         
         c1, c2 = st.columns(2)
         new_dur = c1.number_input("Duration (Days)", value=t_data['duration'], min_value=1)
@@ -240,9 +258,13 @@ def edit_task_popup(task_id, project_id, user_id):
         for _, s in subs.iterrows(): sub_opts[s['id']] = s['company_name']
         
         curr_sub = t_data['subcontractor_id'] if pd.notna(t_data['subcontractor_id']) else 0
-        new_sub = st.selectbox("Subcontractor", options=list(sub_opts.keys()), 
+        
+        c3, c4 = st.columns(2)
+        new_sub = c3.selectbox("Subcontractor", options=list(sub_opts.keys()), 
                                format_func=lambda x: sub_opts[x], 
                                index=list(sub_opts.keys()).index(curr_sub) if curr_sub in sub_opts else 0)
+        
+        exposure = c4.selectbox("Exposure", ["Indoor", "Outdoor"], index=0 if t_data['exposure'] == "Indoor" else 1)
 
         # Dependencies
         all_t = run_query("SELECT id, name FROM tasks WHERE project_id=:pid", {"pid": project_id})
@@ -253,39 +275,54 @@ def edit_task_popup(task_id, project_id, user_id):
         
         new_deps = st.multiselect("Predecessors", options=t_opts.keys(), format_func=lambda x: t_opts[x], default=[d for d in curr_deps if d in t_opts])
         
+        st.markdown("---")
         col_save, col_del = st.columns([1, 1])
         with col_save:
             if st.form_submit_button("💾 Save Task", type="primary"):
                 ov_str = str(start_ov) if start_ov else None
                 dep_json = json.dumps(new_deps)
                 
-                # Determine Phase string
+                # Use selected phase or default to General
                 final_phase = sel_phase if sel_phase != "Custom" else "General"
                 
                 if is_edit_mode:
-                    execute_statement("""UPDATE tasks SET name=:n, phase=:p, duration=:d, start_date_override=:ov, subcontractor_id=:sub, dependencies=:dep WHERE id=:id""", 
-                        {"n": new_name, "p": final_phase, "d": new_dur, "ov": ov_str, "sub": new_sub, "dep": dep_json, "id": task_id})
+                    execute_statement("""UPDATE tasks SET name=:n, phase=:p, duration=:d, start_date_override=:ov, subcontractor_id=:sub, dependencies=:dep, exposure=:e WHERE id=:id""", 
+                        {"n": new_name, "p": final_phase, "d": new_dur, "ov": ov_str, "sub": new_sub, "dep": dep_json, "e": exposure, "id": task_id})
                 else:
-                    execute_statement("""INSERT INTO tasks (project_id, name, phase, duration, start_date_override, subcontractor_id, dependencies) 
-                        VALUES (:pid, :n, :p, :d, :ov, :sub, :dep)""",
-                        {"pid": project_id, "n": new_name, "p": final_phase, "d": new_dur, "ov": ov_str, "sub": new_sub, "dep": dep_json})
+                    execute_statement("""INSERT INTO tasks (project_id, name, phase, duration, start_date_override, subcontractor_id, dependencies, exposure) 
+                        VALUES (:pid, :n, :p, :d, :ov, :sub, :dep, :e)""",
+                        {"pid": project_id, "n": new_name, "p": final_phase, "d": new_dur, "ov": ov_str, "sub": new_sub, "dep": dep_json, "e": exposure})
                 
                 st.session_state.active_popup = None
                 st.rerun()
         
         with col_del:
             if is_edit_mode:
-                if st.form_submit_button("🗑️ Delete"):
+                if st.form_submit_button("🗑️ Delete Task"):
                     execute_statement("DELETE FROM tasks WHERE id=:id", {"id": task_id})
                     st.session_state.active_popup = None
                     st.rerun()
+
+    # Quick Add Sub (Outside Form)
+    with st.expander("➕ Create New Subcontractor"):
+        c_sub1, c_sub2 = st.columns(2)
+        new_sub_name = c_sub1.text_input("Company Name", key="ns_name")
+        new_sub_contact = c_sub2.text_input("Contact Name", key="ns_cont")
+        if st.button("Quick Add Sub"):
+            if new_sub_name:
+                execute_statement("INSERT INTO subcontractors (user_id, company_name, contact_name) VALUES (:u, :c, :ct)",
+                    {"u": user_id, "c": new_sub_name, "ct": new_sub_contact})
+                st.success("Added!")
+                time.sleep(0.5); st.rerun()
 
 @dialog_decorator("⚠️ Report Delay")
 def delay_popup(project_id):
     p_tasks = run_query("SELECT id, name, duration FROM tasks WHERE project_id=:pid", {"pid": project_id})
     task_map = {row['id']: f"{row['name']} ({row['duration']} days)" for _, row in p_tasks.iterrows()}
     
-    tab1, tab2 = st.tabs(["Log Delay", "Manage"])
+    tab1, tab2 = st.tabs(["Log Delay", "Manage Delays"])
+    
+    # TAB 1: LOG NEW
     with tab1:
         with st.form("delay_form"):
             st.warning("Delays extend task duration.")
@@ -293,33 +330,45 @@ def delay_popup(project_id):
             reason = c1.selectbox("Cause", ["Weather", "Materials", "Contractor", "Inspection", "Other"])
             days = c2.number_input("Days Lost", min_value=1, value=1)
             event_date = st.date_input("Date", value=datetime.date.today())
+            
+            desc = st.text_area("Explanation")
             affected = st.multiselect("Affected Tasks", options=task_map.keys(), format_func=lambda x: task_map[x])
             
             if st.form_submit_button("Submit", type="primary"):
                 if affected:
                     aff_json = json.dumps(affected)
-                    execute_statement("""INSERT INTO delay_events (project_id, reason, days_lost, affected_task_ids, event_date) 
-                        VALUES (:pid, :r, :d, :a, :date)""",
-                        {"pid": project_id, "r": reason, "d": days, "a": aff_json, "date": str(event_date)})
+                    execute_statement("""INSERT INTO delay_events (project_id, reason, days_lost, affected_task_ids, event_date, description) 
+                        VALUES (:pid, :r, :d, :a, :date, :desc)""",
+                        {"pid": project_id, "r": reason, "d": days, "a": aff_json, "date": str(event_date), "desc": desc})
                     for tid in affected:
                         execute_statement("UPDATE tasks SET duration = duration + :d WHERE id=:tid", {"d": days, "tid": tid})
                     st.success("Logged!"); st.session_state.active_popup = None; st.rerun()
+                else: st.error("Select at least one task.")
+    
+    # TAB 2: MANAGE
     with tab2:
         delays = run_query("SELECT * FROM delay_events WHERE project_id=:pid ORDER BY event_date DESC", {"pid": project_id})
-        if not delays.empty:
+        if delays.empty:
+            st.info("No delays logged.")
+        else:
             for _, d in delays.iterrows():
-                if st.button(f"Delete: {d['reason']} ({d['days_lost']}d) - {d['event_date']}", key=f"del_{d['id']}"):
-                    try:
-                        for tid in json.loads(d['affected_task_ids']):
-                            execute_statement("UPDATE tasks SET duration = duration - :d WHERE id=:tid", {"d": d['days_lost'], "tid": int(tid)})
-                    except: pass
-                    execute_statement("DELETE FROM delay_events WHERE id=:id", {"id": d['id']})
-                    st.rerun()
+                with st.expander(f"{d['event_date']} - {d['reason']} ({d['days_lost']} Days)"):
+                    st.write(f"**Description:** {d['description']}")
+                    st.caption("Deleting this will reverse the time addition.")
+                    if st.button("Delete Delay", key=f"del_{d['id']}"):
+                        try:
+                            for tid in json.loads(d['affected_task_ids']):
+                                execute_statement("UPDATE tasks SET duration = duration - :d WHERE id=:tid", {"d": d['days_lost'], "tid": int(tid)})
+                        except: pass
+                        execute_statement("DELETE FROM delay_events WHERE id=:id", {"id": d['id']})
+                        st.success("Reverted!")
+                        st.rerun()
 
 # --- 6. AUTH & SESSION ---
 if 'user_id' not in st.session_state: st.session_state.user_id = None
 if 'active_popup' not in st.session_state: st.session_state.active_popup = None 
 if 'editing_id' not in st.session_state: st.session_state.editing_id = None 
+if 'page' not in st.session_state: st.session_state.page = "Dashboard"
 
 if COOKIE_MANAGER_AVAILABLE:
     cookie_manager = stx.CookieManager()
@@ -335,19 +384,40 @@ if COOKIE_MANAGER_AVAILABLE:
 if st.session_state.user_id is None:
     st.image("https://balanceandbuildconsulting.com/wp-content/uploads/2026/01/ScheduleSite-Pro-Logo.png", width=300)
     st.title("Login")
-    u = st.text_input("Username").lower().strip()
-    p = st.text_input("Password", type="password")
-    if st.button("Login"):
-        df = run_query("SELECT id, password FROM users WHERE LOWER(username)=:u", {"u": u})
-        if not df.empty and df.iloc[0]['password'] == p:
-            st.session_state.user_id = int(df.iloc[0]['id'])
-            if COOKIE_MANAGER_AVAILABLE: cookie_manager.set("bb_user", u)
-            st.rerun()
+    
+    # RESTORED TABS FOR SIGNUP
+    tab1, tab2 = st.tabs(["Login", "Signup"])
+    
+    with tab1:
+        u = st.text_input("Username").lower().strip()
+        p = st.text_input("Password", type="password")
+        if st.button("Login"):
+            df = run_query("SELECT id, password FROM users WHERE LOWER(username)=:u", {"u": u})
+            if not df.empty and df.iloc[0]['password'] == p:
+                st.session_state.user_id = int(df.iloc[0]['id'])
+                if COOKIE_MANAGER_AVAILABLE: cookie_manager.set("bb_user", u)
+                st.rerun()
+            else: st.error("Invalid credentials")
+            
+    with tab2:
+        st.subheader("Create Account")
+        new_u = st.text_input("New Username").lower().strip()
+        new_p = st.text_input("New Password", type="password")
+        new_email = st.text_input("Email (Optional)")
+        if st.button("Create Account"):
+            if new_u and new_p:
+                check = run_query("SELECT id FROM users WHERE username=:u", {"u": new_u})
+                if not check.empty:
+                    st.error("Username taken.")
+                else:
+                    execute_statement("INSERT INTO users (username, password, email, created_at, scheduler_status) VALUES (:u, :p, :e, :d, 'Trial')",
+                                      {"u": new_u, "p": new_p, "e": new_email, "d": str(datetime.date.today())})
+                    st.success("Account Created! Please Login.")
+            else: st.error("Username and Password required.")
     st.stop()
 
 # --- 7. MAIN LAYOUT ---
 user_id = st.session_state.user_id
-if 'page' not in st.session_state: st.session_state.page = "Dashboard"
 
 with st.sidebar:
     st.image("https://balanceandbuildconsulting.com/wp-content/uploads/2026/01/ScheduleSite-Pro-Logo.png", use_container_width=True)
@@ -365,14 +435,21 @@ if page == "Dashboard":
     st.title("Command Center")
     proj_count = run_query("SELECT COUNT(*) FROM projects WHERE user_id=:uid", {"uid": user_id}).iloc[0,0]
     st.metric("Total Projects", proj_count)
+    
+    st.subheader("Your Projects")
+    projs = run_query("SELECT * FROM projects WHERE user_id=:u ORDER BY id DESC", {"u": user_id})
+    if not projs.empty:
+        st.dataframe(projs[['name', 'client_name', 'start_date', 'status']], use_container_width=True)
 
 elif page == "New Project":
     st.title("New Project")
     with st.form("new_p"):
         n = st.text_input("Name")
+        c = st.text_input("Client Name")
         s = st.date_input("Start Date")
         if st.form_submit_button("Create", type="primary"):
-            execute_statement("INSERT INTO projects (user_id, name, start_date) VALUES (:u, :n, :s)", {"u": user_id, "n": n, "s": str(s)})
+            execute_statement("INSERT INTO projects (user_id, name, client_name, start_date) VALUES (:u, :n, :c, :s)", 
+                              {"u": user_id, "n": n, "c": c, "s": str(s)})
             st.success("Created!"); st.session_state.page = "Scheduler"; st.rerun()
 
 elif page == "Scheduler":
@@ -380,7 +457,7 @@ elif page == "Scheduler":
     my_projs = run_query("SELECT id, name FROM projects WHERE user_id=:u", {"u": user_id})
     
     if my_projs.empty:
-        st.warning("No projects.")
+        st.warning("No projects. Go to 'New Project' to start.")
     else:
         c1, c2 = st.columns([3, 2])
         with c1:
@@ -398,19 +475,26 @@ elif page == "Scheduler":
         delays = run_query("SELECT * FROM delay_events WHERE project_id=:pid", {"pid": pid})
 
         if not t_df.empty:
-            # GANTT CHART (Grouped by Phase)
-            t_df['Color'] = t_df.apply(lambda x: '#DAA520' if x.get('is_critical') else '#2B588D', axis=1)
+            # PROJECTED COMPLETION BANNER
+            max_end = pd.to_datetime(t_df['end_date']).max().date()
+            st.markdown(f"""<div class="completion-banner">🏁 Projected Completion Date: {max_end.strftime('%B %d, %Y')}</div>""", unsafe_allow_html=True)
+
+            # GANTT CHART (Grouped by Phase with Red Overlay)
+            t_df['Color'] = t_df.apply(lambda x: '#DAA520' if x.get('is_critical') else ('#2B588D' if x['exposure']=='Indoor' else '#E65100'), axis=1)
             
+            # Sort order for phases (Custom order is hard without a map, so we use alphabetical or database order)
             base = alt.Chart(t_df).mark_bar(cornerRadius=5, height=20).encode(
                 x=alt.X('start_date:T', title='Date'),
                 x2='end_date:T',
-                y=alt.Y('name:N', sort='x', title='Task'),
-                row=alt.Row('phase:N', title='Phase', sort=['Pre-Construction', 'Site Preparation', 'Foundation']), # Basic sorting, can be enhanced
+                y=alt.Y('name:N', sort='start_date', title='Task'),
+                row=alt.Row('phase:N', title='Phase', sort=['Pre-Construction', 'Site Preparation', 'Foundation', 'Framing']), 
                 color=alt.Color('Color', scale=None),
-                tooltip=['phase', 'name', 'start_date', 'end_date']
+                tooltip=['phase', 'name', 'start_date', 'end_date', 'duration']
             )
             
             final_chart = base
+            
+            # Delay Overlay
             if not delays.empty:
                 delay_rows = []
                 for _, d in delays.iterrows():
@@ -433,20 +517,22 @@ elif page == "Scheduler":
             st.altair_chart(final_chart.interactive(), use_container_width=True)
             
             # DATA GRID
-            st.write("### Tasks")
+            st.markdown("### Task Details")
             editor_df = t_df[['id', 'phase', 'name', 'start_date', 'end_date', 'duration']].copy()
             editor_df['Edit'] = False
             
-            edited_data = st.data_editor(editor_df, hide_index=True, key="gantt_grid", disabled=["phase", "start_date", "end_date"])
+            edited_data = st.data_editor(editor_df, hide_index=True, key="gantt_grid", 
+                                         disabled=["phase", "start_date", "end_date"],
+                                         column_config={"Edit": st.column_config.CheckboxColumn(required=True)})
             
-            # Handle Edits
+            # Handle Edits (Clicking Checkbox)
             t_to_edit = edited_data[edited_data['Edit'] == True]
             if not t_to_edit.empty:
                 st.session_state.active_popup = 'edit_task'
                 st.session_state.editing_id = int(t_to_edit.iloc[0]['id'])
                 st.rerun()
 
-            # Handle Value Changes (Inline Duration Edit)
+            # Handle Inline Value Changes
             for i, row in edited_data.iterrows():
                 orig = t_df[t_df['id'] == row['id']].iloc[0]
                 if row['duration'] != orig['duration'] or row['name'] != orig['name']:
@@ -460,4 +546,11 @@ elif page == "Scheduler":
 
 elif page == "Settings":
     st.title("Settings")
-    # ... (Settings code remains similar)
+    user_data = run_query("SELECT company_name, contractor_types FROM users WHERE id=:uid", {"uid": user_id}).iloc[0]
+    
+    with st.form("set_f"):
+        st.subheader("Company Profile")
+        cn = st.text_input("Company Name", value=user_data['company_name'] if user_data['company_name'] else "")
+        if st.form_submit_button("Save"):
+            execute_statement("UPDATE users SET company_name=:n WHERE id=:u", {"n": cn, "u": user_id})
+            st.success("Saved!")
