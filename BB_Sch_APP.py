@@ -74,8 +74,6 @@ def execute_statement(query, params=None):
             result = conn.execute(text(query), params)
             if result.rowcount > 0 and 'INSERT' in query.upper():
                 try:
-                    # Try to retrieve ID for Postgres (common issue with some drivers)
-                    # We rely on RETURNING clause in SQL if needed, but for now we fallback
                     return result.lastrowid
                 except:
                     return 1 
@@ -111,7 +109,8 @@ def init_db():
         )''',
         "delay_events": '''CREATE TABLE IF NOT EXISTS delay_events (
             id SERIAL PRIMARY KEY, project_id INTEGER, reason TEXT,
-            days_lost INTEGER, affected_task_ids TEXT, event_date TEXT
+            days_lost INTEGER, affected_task_ids TEXT, event_date TEXT,
+            description TEXT, photo_data BYTEA
         )'''
     }
     for table_name, sql in tables.items():
@@ -119,10 +118,13 @@ def init_db():
             with engine.begin() as conn: conn.execute(text(sql))
         except Exception as e: print(f"Error creating table {table_name}: {e}")
 
+    # Migrations for new columns
     safe_alters = [
         "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS dependencies TEXT",
         "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS subcontractor_id INTEGER",
-        "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS start_date_override TEXT"
+        "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS start_date_override TEXT",
+        "ALTER TABLE delay_events ADD COLUMN IF NOT EXISTS description TEXT",
+        "ALTER TABLE delay_events ADD COLUMN IF NOT EXISTS photo_data BYTEA"
     ]
     with engine.begin() as conn:
         for alter in safe_alters:
@@ -208,7 +210,7 @@ def calculate_schedule_dates(tasks_df, project_start_date_str):
             if t['early_finish'] == max_finish: t['is_critical'] = True
     return pd.DataFrame(tasks)
 
-# --- 5. POPUP DIALOG (Task Editor) ---
+# --- 5. POPUP DIALOGS ---
 if hasattr(st, 'dialog'): dialog_decorator = st.dialog
 elif hasattr(st, 'experimental_dialog'): dialog_decorator = st.experimental_dialog
 else:
@@ -228,31 +230,22 @@ def edit_task_popup(task_id, project_id, user_id):
                           {"pid": project_id, "tid": task_id})
     task_opts = {row['id']: row['name'] for _, row in all_tasks.iterrows()}
     
-    # Subcontractor Query
     subs = run_query("SELECT id, company_name FROM subcontractors WHERE user_id=:u", {"u": user_id})
     sub_opts = {0: "Unassigned"}
     for _, s in subs.iterrows(): sub_opts[s['id']] = s['company_name']
 
-    # --- QUICK ADD SUBCONTRACTOR SECTION ---
+    # QUICK ADD SUB
     with st.expander("➕ Create New Subcontractor (Optional)"):
-        c_sub1, c_sub2, c_sub3 = st.columns([2, 2, 1])
+        c_sub1, c_sub2 = st.columns(2)
         new_sub_name = c_sub1.text_input("Company Name", key="ns_name")
         new_sub_contact = c_sub2.text_input("Contact Name", key="ns_cont")
-        
-        # We use a separate button logic here that doesn't submit the main form
         if st.button("Quick Add Sub"):
             if new_sub_name:
-                execute_statement(
-                    "INSERT INTO subcontractors (user_id, company_name, contact_name) VALUES (:u, :c, :ct)",
-                    {"u": user_id, "c": new_sub_name, "ct": new_sub_contact}
-                )
-                st.success("Subcontractor Added!")
-                time.sleep(0.5)
-                st.rerun() # Rerun to refresh the list in the form below
-            else:
-                st.error("Company Name Required")
+                execute_statement("INSERT INTO subcontractors (user_id, company_name, contact_name) VALUES (:u, :c, :ct)",
+                    {"u": user_id, "c": new_sub_name, "ct": new_sub_contact})
+                st.success("Added!"); time.sleep(0.5); st.rerun()
 
-    # --- MAIN TASK FORM ---
+    # FORM
     with st.form("popup_form"):
         st.caption(f"Editing: {t_data['name']}")
         c1, c2 = st.columns(2)
@@ -260,47 +253,80 @@ def edit_task_popup(task_id, project_id, user_id):
         new_dur = c2.number_input("Duration (Days)", value=t_data['duration'], min_value=1)
         
         c3, c4 = st.columns(2)
-        start_ov = c3.date_input("Manual Start Date (Optional)", 
-                               value=datetime.datetime.strptime(t_data['start_date_override'], '%Y-%m-%d') if t_data['start_date_override'] else None)
-        
+        start_ov = c3.date_input("Manual Start Date", value=datetime.datetime.strptime(t_data['start_date_override'], '%Y-%m-%d') if t_data['start_date_override'] else None)
         curr_sub = t_data['subcontractor_id'] if pd.notna(t_data['subcontractor_id']) else 0
-        new_sub = c4.selectbox("Subcontractor", options=list(sub_opts.keys()), 
-                               format_func=lambda x: sub_opts[x], 
-                               index=list(sub_opts.keys()).index(curr_sub) if curr_sub in sub_opts else 0)
+        new_sub = c4.selectbox("Subcontractor", options=list(sub_opts.keys()), format_func=lambda x: sub_opts[x], index=list(sub_opts.keys()).index(curr_sub) if curr_sub in sub_opts else 0)
 
         curr_deps = []
         if t_data['dependencies']:
             try: curr_deps = [int(x) for x in json.loads(t_data['dependencies'])]
             except: pass
         
-        new_deps = st.multiselect("Predecessors (Must finish before this starts)", options=task_opts.keys(), 
-                                  format_func=lambda x: task_opts[x],
-                                  default=[d for d in curr_deps if d in task_opts])
+        new_deps = st.multiselect("Predecessors", options=task_opts.keys(), format_func=lambda x: task_opts[x], default=[d for d in curr_deps if d in task_opts])
         
         st.markdown("---")
         m1, m2 = st.columns(2)
-        lead_time = m1.number_input("Material Lead Time (Days)", value=t_data['material_lead_time'])
+        lead_time = m1.number_input("Material Lead Time", value=t_data['material_lead_time'])
         exposure = m2.selectbox("Exposure", ["Indoor", "Outdoor"], index=0 if t_data['exposure'] == "Indoor" else 1)
         
         if st.form_submit_button("💾 Save Changes"):
             ov_str = str(start_ov) if start_ov else None
             dep_json = json.dumps(new_deps)
-            execute_statement("""
-                UPDATE tasks 
-                SET name=:n, duration=:d, start_date_override=:ov, subcontractor_id=:sub, 
-                    dependencies=:dep, material_lead_time=:m, exposure=:e
-                WHERE id=:id
-            """, {
-                "n": new_name, "d": new_dur, "ov": ov_str, "sub": new_sub,
-                "dep": dep_json, "m": lead_time, "e": exposure, "id": task_id
-            })
+            execute_statement("""UPDATE tasks SET name=:n, duration=:d, start_date_override=:ov, subcontractor_id=:sub, 
+                dependencies=:dep, material_lead_time=:m, exposure=:e WHERE id=:id""", 
+                {"n": new_name, "d": new_dur, "ov": ov_str, "sub": new_sub, "dep": dep_json, "m": lead_time, "e": exposure, "id": task_id})
+            
+            # Close popup logic
+            st.session_state.editing_task_id = None
             st.rerun()
+
+@dialog_decorator("⚠️ Report Delay")
+def delay_popup(project_id):
+    # Fetch tasks to select from
+    p_tasks = run_query("SELECT id, name, duration FROM tasks WHERE project_id=:pid", {"pid": project_id})
+    task_map = {row['id']: f"{row['name']} ({row['duration']} days)" for _, row in p_tasks.iterrows()}
+    
+    with st.form("delay_form"):
+        st.warning("Delays will extend the duration of affected tasks and push out the schedule.")
+        
+        c1, c2 = st.columns(2)
+        reason = c1.selectbox("Cause of Delay", ["Weather", "Materials", "Contractor", "Owner", "Inspection", "Other"])
+        days = c2.number_input("Days Lost", min_value=1, value=1)
+        
+        desc = st.text_area("Explanation / Description")
+        
+        affected = st.multiselect("Select Affected Tasks", options=task_map.keys(), format_func=lambda x: task_map[x])
+        
+        photo = st.file_uploader("Upload Evidence (Photo)", type=['png', 'jpg', 'jpeg'])
+        
+        if st.form_submit_button("🚨 Submit Delay"):
+            if affected:
+                p_data = photo.read() if photo else None
+                aff_json = json.dumps(affected)
+                
+                # 1. Log Event
+                execute_statement("""INSERT INTO delay_events 
+                    (project_id, reason, days_lost, affected_task_ids, event_date, description, photo_data) 
+                    VALUES (:pid, :r, :d, :a, :date, :desc, :p)""",
+                    {"pid": project_id, "r": reason, "d": days, "a": aff_json, 
+                     "date": str(datetime.date.today()), "desc": desc, "p": p_data})
+                
+                # 2. Update Schedule (Add duration to tasks)
+                for tid in affected:
+                    execute_statement("UPDATE tasks SET duration = duration + :d WHERE id=:tid", {"d": days, "tid": tid})
+                
+                st.success("Schedule Updated!")
+                st.session_state.show_delay_popup = False
+                st.rerun()
+            else:
+                st.error("Please select at least one task affected by this delay.")
 
 # --- 6. SESSION & AUTH ---
 if 'user_id' not in st.session_state: st.session_state.user_id = None
 if 'username' not in st.session_state: st.session_state.username = ""
 if 'page' not in st.session_state: st.session_state.page = "Dashboard"
-if 'editing_task_id' not in st.session_state: st.session_state.editing_task_id = None # TRACKER FOR POPUP
+if 'editing_task_id' not in st.session_state: st.session_state.editing_task_id = None 
+if 'show_delay_popup' not in st.session_state: st.session_state.show_delay_popup = False
 
 if COOKIE_MANAGER_AVAILABLE:
     cookie_manager = stx.CookieManager()
@@ -422,20 +448,20 @@ elif page == "Scheduler":
     if my_projs.empty:
         st.warning("No projects found.")
     else:
-        c_sel, c_act = st.columns([3, 1])
+        c_sel, c_btns = st.columns([2, 2])
         with c_sel:
             sel_proj_name = st.selectbox("Select Project", my_projs['name'], label_visibility="collapsed")
             pid = int(my_projs[my_projs['name'] == sel_proj_name].iloc[0]['id'])
-        with c_act:
-            if st.button("➕ Add Task"):
-                # Insert Task First
+        with c_btns:
+            b1, b2 = st.columns(2)
+            if b1.button("➕ Add Task"):
                 execute_statement("INSERT INTO tasks (project_id, name, duration) VALUES (:pid, 'New Task', 1)", {"pid": pid})
-                # Attempt to get the ID of the task we just made to open popup
-                # Postgres workaround: fetch latest task ID for this project
                 last_task = run_query("SELECT id FROM tasks WHERE project_id=:pid ORDER BY id DESC LIMIT 1", {"pid": pid})
                 if not last_task.empty:
                     st.session_state.editing_task_id = int(last_task.iloc[0]['id'])
                 st.rerun()
+            if b2.button("⚠️ Log Delay"):
+                st.session_state.show_delay_popup = True
 
         p_data = run_query("SELECT * FROM projects WHERE id=:id", {"id": pid}).iloc[0]
         t_df = run_query("SELECT * FROM tasks WHERE project_id=:pid", {"pid": pid})
@@ -468,7 +494,6 @@ elif page == "Scheduler":
                 }, disabled=["start_date", "end_date"], hide_index=True, use_container_width=True, key="gantt_editor"
             )
             
-            # 1. Check for Inline Edits
             for index, row in edited_data.iterrows():
                 orig = t_df[t_df['id'] == row['id']].iloc[0]
                 if (row['duration'] != orig['duration'] or row['name'] != orig['name'] or row['exposure'] != orig['exposure']):
@@ -476,18 +501,16 @@ elif page == "Scheduler":
                         {"d": row['duration'], "n": row['name'], "e": row['exposure'], "id": row['id']})
                     st.rerun()
 
-            # 2. Check for Manual Edit Button Click
+            # Handle Popups
             t_to_edit = edited_data[edited_data['Edit'] == True]
             if not t_to_edit.empty:
                 st.session_state.editing_task_id = int(t_to_edit.iloc[0]['id'])
 
-            # 3. TRIGGER POPUP (Either from "Add Task" or "Edit" checkbox)
             if st.session_state.editing_task_id:
                 edit_task_popup(st.session_state.editing_task_id, pid, user_id)
-                # We do NOT unset it here; Streamlit dialogs handle closure naturally. 
-                # But to prevent sticking, we check if the user is done or not. 
-                # Actually, simply calling it triggers the modal. The modal has its own close logic.
-                # Just ensuring we don't clear it before it renders.
+            
+            if st.session_state.show_delay_popup:
+                delay_popup(pid)
 
 elif page == "Settings":
     st.title("Settings")
