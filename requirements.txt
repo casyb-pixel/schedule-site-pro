@@ -4,3 +4,5 @@ sqlalchemy
 psycopg2-binary
 altair
 extra-streamlit-components
+matplotlib
+Pillow
