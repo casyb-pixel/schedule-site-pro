@@ -334,7 +334,7 @@ def generate_pdf_report(project, tasks_df, delay_df, upcoming_count, completion_
             pdf.cell(20, 8, str(row['days_lost']), 1, 0, 'C')
             pdf.cell(0, 8, clean_desc, 1, 1, 'L')
 
-    return pdf.output(dest='S').encode('latin-1')
+    return bytes(pdf.output())
 
 # --- 7. POPUPS ---
 if hasattr(st, 'dialog'): dialog_decorator = st.dialog
