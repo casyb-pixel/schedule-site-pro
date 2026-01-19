@@ -34,6 +34,18 @@ st.markdown("""
         border-top: 5px solid #2B588D; margin-bottom: 15px; height: 140px;
         display: flex; flex-direction: column; justify-content: center;
     }
+    
+    /* NEW: Scrollable Task List Card */
+    .task-list-card {
+        background-color: white; padding: 15px; border-radius: 12px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+        border-top: 5px solid #2B588D; margin-bottom: 15px; height: 140px;
+        overflow-y: auto; /* Allows scrolling if list is long */
+    }
+    .task-list-item {
+        font-size: 0.85rem; border-bottom: 1px solid #f0f0f0; padding: 4px 0; text-align: left;
+    }
+    
     .metric-value { font-size: 2.2rem; font-weight: 800; color: #2B588D; }
     .metric-label { font-size: 0.95rem; color: #555; text-transform: uppercase; letter-spacing: 1px; margin-top: 5px; }
     
@@ -457,15 +469,26 @@ if st.session_state.page == "Dashboard":
         with tab_dash:
             final_date = pd.to_datetime(tasks['end_date']).max().strftime('%b %d, %Y')
             
-            # --- METRIC 2: TASKS STARTING IN NEXT 2 WEEKS ---
-            # Using sim_date as the reference point
+            # --- METRIC 2: LIST OF TASKS STARTING IN NEXT 2 WEEKS ---
             two_weeks_out = sim_date + datetime.timedelta(days=14)
             tasks['start_dt_obj'] = pd.to_datetime(tasks['start_date']).dt.date
-            upcoming_count = len(tasks[ (tasks['start_dt_obj'] >= sim_date) & (tasks['start_dt_obj'] <= two_weeks_out) ])
+            upcoming_tasks_df = tasks[ (tasks['start_dt_obj'] >= sim_date) & (tasks['start_dt_obj'] <= two_weeks_out) ]
+            
+            if upcoming_tasks_df.empty:
+                list_html = "<div style='color:#999; font-style:italic; padding:10px;'>No upcoming tasks</div>"
+            else:
+                items = "".join([f"<div class='task-list-item'>• <strong>{row['name']}</strong> <br><span style='color:#888; font-size:0.8em; margin-left:10px;'>{row['start_date']}</span></div>" for _, row in upcoming_tasks_df.iterrows()])
+                list_html = items
 
             c1, c2 = st.columns(2)
             c1.markdown(f"<div class='metric-card'><div class='metric-value'>{final_date}</div><div class='metric-label'>Completion</div></div>", unsafe_allow_html=True)
-            c2.markdown(f"<div class='metric-card'><div class='metric-value'>{upcoming_count}</div><div class='metric-label'>Tasks Starting (2 Wks)</div></div>", unsafe_allow_html=True)
+            # Use the new Scrollable Card Style
+            c2.markdown(f"""
+                <div class='task-list-card'>
+                    <div class='metric-label' style='margin-bottom:8px; border-bottom:2px solid #eee; padding-bottom:5px;'>Starting (Next 14 Days)</div>
+                    {list_html}
+                </div>
+            """, unsafe_allow_html=True)
             
             st.divider()
             
@@ -585,8 +608,9 @@ if st.session_state.page == "Dashboard":
                     
                     st.success("Updated!")
                     st.session_state.active_popup = None
-                    # Clear cache to ensure next query picks up new status
+                    # Clear cache to ensure next query picks up new status and sleep for commit
                     st.cache_resource.clear()
+                    time.sleep(0.5) 
                     st.rerun()
         order_popup(target_tid)
 
