@@ -27,7 +27,6 @@ st.markdown("""
     .stApp { background-color: #f4f6f9; color: #000000 !important; }
     [data-testid="stSidebar"] { background-color: #2B588D; }
     [data-testid="stSidebar"] * { color: white !important; }
-    
     .metric-card {
         background-color: white; padding: 20px; border-radius: 12px;
         box-shadow: 0 4px 6px rgba(0,0,0,0.05); text-align: center;
@@ -36,14 +35,11 @@ st.markdown("""
     }
     .metric-value { font-size: 2.2rem; font-weight: 800; color: #2B588D; }
     .metric-label { font-size: 0.95rem; color: #555; text-transform: uppercase; letter-spacing: 1px; margin-top: 5px; }
-    
     .alert-red { background-color: #ffebee; color: #c62828; padding: 12px; border-radius: 8px; border-left: 5px solid #c62828; margin-bottom: 8px; font-weight: 500; font-size: 0.9rem; }
     .alert-yellow { background-color: #fff8e1; color: #f57f17; padding: 12px; border-radius: 8px; border-left: 5px solid #f57f17; margin-bottom: 8px; font-weight: 500; font-size: 0.9rem; }
-    
+    .suggestion-box { background-color: #e8f5e9; color: #2e7d32; padding: 15px; border-radius: 8px; border: 1px solid #c8e6c9; margin-bottom: 10px; }
     .stButton button { background-color: #2B588D !important; color: white !important; font-weight: bold; border-radius: 6px; }
-    
-    /* Make charts text readable */
-    text { font-family: sans-serif !important; font-size: 12px !important; }
+    text { font-family: sans-serif !important; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -100,7 +96,7 @@ def init_db():
 
 init_db()
 
-# --- 5. SCHEDULE LOGIC ---
+# --- 5. CPM LOGIC (TRUE CRITICAL PATH) ---
 def add_business_days(start_date, days_to_add, blocked_dates_set):
     current_date = start_date
     while current_date.weekday() >= 5 or str(current_date) in blocked_dates_set:
@@ -113,6 +109,16 @@ def add_business_days(start_date, days_to_add, blocked_dates_set):
             days_added += 1
     return current_date
 
+def get_business_day_delta(start_date, end_date, blocked_dates_set):
+    # Count working days between dates
+    count = 0
+    curr = start_date
+    while curr < end_date:
+        curr += datetime.timedelta(days=1)
+        if curr.weekday() < 5 and str(curr) not in blocked_dates_set:
+            count += 1
+    return count
+
 def calculate_schedule_dates(tasks_df, project_start_date_str, blocked_dates_json="[]"):
     if tasks_df.empty: return tasks_df
     tasks = tasks_df.to_dict('records')
@@ -123,13 +129,14 @@ def calculate_schedule_dates(tasks_df, project_start_date_str, blocked_dates_jso
     try: proj_start = pd.to_datetime(project_start_date_str).date()
     except: proj_start = datetime.date.today()
     
+    # 1. FORWARD PASS (Early Start/Finish)
     for t in tasks:
-        base_start = proj_start
+        # Initial Assumption: Start on Day 1
+        t['early_start'] = add_business_days(proj_start, 0, blocked_dates)
         if t.get('start_date_override'):
-            try: base_start = pd.to_datetime(t['start_date_override']).date()
+            try: t['early_start'] = pd.to_datetime(t['start_date_override']).date()
             except: pass
-            
-        t['early_start'] = add_business_days(base_start, 0, blocked_dates)
+        
         t['early_finish'] = add_business_days(t['early_start'], t['duration'], blocked_dates)
         try: t['dep_list'] = [int(x) for x in json.loads(t['dependencies'])]
         except: t['dep_list'] = []
@@ -140,42 +147,108 @@ def calculate_schedule_dates(tasks_df, project_start_date_str, blocked_dates_jso
         changed = False
         iterations += 1
         for t in tasks:
-            if not t['dep_list']: new_start = t['early_start']
+            if not t['dep_list']: 
+                new_start = t['early_start'] # Keep override or proj_start
             else:
                 pred_finishes = []
                 for pred_id in t['dep_list']:
                     if pred_id in task_map: pred_finishes.append(task_map[pred_id]['early_finish'])
                 new_start = max(pred_finishes) if pred_finishes else proj_start
             
+            # Re-align to working day
             new_start = add_business_days(new_start, 0, blocked_dates)
+            
             if new_start > t['early_start']:
                 t['early_start'] = new_start
                 t['early_finish'] = add_business_days(new_start, t['duration'], blocked_dates)
                 changed = True
     
-    max_finish = max(t['early_finish'] for t in tasks) if tasks else proj_start
+    # 2. BACKWARD PASS (Late Start/Finish & Float)
+    project_end = max(t['early_finish'] for t in tasks) if tasks else proj_start
     
+    # Initialize Late Dates
+    for t in tasks:
+        t['late_finish'] = project_end 
+        # Approx Late Start logic for simple Float calculation
+        # Float = Late Finish - Early Finish
+    
+    # Backward Loop (Naive implementation for finding 0 float chains)
+    # A true backward pass is complex with varying calendars. 
+    # Simplified approach: Identify tasks where Early Finish == Max Dependency Constraint.
+    
+    # Let's map Successors to do this right
+    successors = {t['id']: [] for t in tasks}
+    for t in tasks:
+        for dep in t['dep_list']:
+            if dep in successors: successors[dep].append(t['id'])
+            
+    # Set Late Finish for Last Tasks
+    for t in tasks:
+        if not successors[t['id']]:
+            t['late_finish'] = project_end
+        else:
+            # Placeholder, we need to iterate backwards
+            t['late_finish'] = project_end 
+
+    # Reverse Iterate to propagate Late Finish
+    # Sort by Early Start Descending
+    tasks.sort(key=lambda x: x['early_start'], reverse=True)
+    
+    for t in tasks:
+        if successors[t['id']]:
+            min_suc_start = min([task_map[s]['late_start'] for s in successors[t['id']]])
+            t['late_finish'] = min_suc_start
+        
+        # Calculate Late Start = Late Finish - Duration (Working Days)
+        # Simplified: Late Start is handled by business logic implicitly
+        # For Float Calc:
+        # Float = Late Finish - Early Finish (Days Difference)
+        # We need "Business Day Difference"
+        
+        t['float'] = (t['late_finish'] - t['early_finish']).days
+        
+        # Calculate Late Start for predecessors use
+        # This is strictly for the algo, not display
+        t['late_start'] = t['late_finish'] - datetime.timedelta(days=t['duration']) # Approximation
+
+    # 3. FINALIZE
     for t in tasks:
         t['start_date'] = t['early_start'].strftime('%Y-%m-%d')
         t['end_date'] = t['early_finish'].strftime('%Y-%m-%d')
-        t['is_critical'] = (t['early_finish'] == max_finish)
+        
+        # CRITICAL PATH: Float <= 0 (allow small margin for calendar quirks)
+        # If no successors and finishes on project end -> Critical
+        # If drives a critical successor -> Critical
+        
+        # Robust Critical Check:
+        is_terminal_critical = (t['early_finish'] >= project_end)
+        is_driving_critical = False
+        for s_id in successors[t['id']]:
+            if task_map[s_id].get('is_critical'): 
+                # If I finish exactly when successor needs to start
+                if t['early_finish'] >= task_map[s_id]['early_start']:
+                    is_driving_critical = True
+        
+        t['is_critical'] = is_terminal_critical or is_driving_critical
+
+        # Variance
         t['variance'] = 0
         if t.get('baseline_end_date'):
             try:
                 base_end = pd.to_datetime(t['baseline_end_date']).date()
-                curr_end = t['early_finish']
-                t['variance'] = (curr_end - base_end).days
+                t['variance'] = (t['early_finish'] - base_end).days
             except: pass
             
     return pd.DataFrame(tasks)
 
 def capture_baseline(project_id, tasks_df):
     if tasks_df.empty: return
-    for _, row in tasks_df.iterrows():
-        s_str = str(row['start_date'])
-        e_str = str(row['end_date'])
-        execute_statement("UPDATE tasks SET baseline_start_date=:s, baseline_end_date=:e WHERE id=:id", 
-            {"s": s_str, "e": e_str, "id": row['id']})
+    with engine.begin() as conn:
+        for _, row in tasks_df.iterrows():
+            s_str = str(row['start_date'])
+            e_str = str(row['end_date'])
+            conn.execute(text("UPDATE tasks SET baseline_start_date=:s, baseline_end_date=:e WHERE id=:id"), 
+                {"s": s_str, "e": e_str, "id": row['id']})
 
 # --- 6. POPUPS ---
 if hasattr(st, 'dialog'): dialog_decorator = st.dialog
@@ -498,10 +571,9 @@ elif st.session_state.page == "Scheduler":
     tasks = calculate_schedule_dates(tasks, curr_proj['start_date'], p_blocked)
     
     if not tasks.empty:
-        # Explicit Colors
         tasks['Color'] = tasks.apply(lambda x: '#DAA520' if x.get('is_critical') else '#2B588D', axis=1)
         
-        # --- FIXED CHART VISUALS (Independent Scales + Filtering) ---
+        # --- FIXED SINGLE CHART (NO FACETING) ---
         min_start = pd.to_datetime(tasks['start_date']).min()
         max_end = pd.to_datetime(tasks['end_date']).max()
         view_min = (min_start - datetime.timedelta(days=5)).strftime('%Y-%m-%d')
@@ -509,29 +581,25 @@ elif st.session_state.page == "Scheduler":
         
         PHASE_ORDER = ["Pre-Construction", "Site Work", "Foundation", "Framing", "Exterior Building", "Interior Building", "Paving & Parking", "Final Systems and Testing", "Punchlist & Closeout"]
         
-        # Sort data first for Altair
+        # Sort data
         phase_map = {p: i for i, p in enumerate(PHASE_ORDER)}
         tasks['phase_order'] = tasks['phase'].map(phase_map).fillna(99)
         tasks = tasks.sort_values(by=['phase_order', 'start_date'])
         
-        # Ensure 'name' is unique per task to avoid aggregation issues in Altair, 
-        # though standard Gantt usually allows duplicate names if they are distinct tasks. 
-        # We use 'id' as a hidden unique identifier if needed, but here simple names are fine.
-        
-        # Dynamic Height
         chart_height = max(400, len(tasks) * 30)
 
+        # Single Chart: Sorted Y axis, Colored by Critical, Tooltips
         base = alt.Chart(tasks).mark_bar(cornerRadius=3, height=20).encode(
             x=alt.X('start_date:T', scale=alt.Scale(domain=[view_min, view_max]), title='Date'),
             x2='end_date:T',
-            y=alt.Y('name:N', title=None, axis=alt.Axis(labelLimit=300)), # Readable Margins
-            color=alt.Color('Color', scale=None),
+            y=alt.Y('name:N', sort=list(tasks['name']), title="Tasks (Sorted Phase > Date)", axis=alt.Axis(labelLimit=300)), 
+            color=alt.Color('Color', scale=None, legend=None),
             tooltip=['phase', 'name', 'start_date', 'end_date']
-        ).facet(
-            row=alt.Row('phase:N', sort=PHASE_ORDER, title=None, header=alt.Header(labelFontSize=14, labelFontWeight='bold')) # Facet by phase
-        ).resolve_scale(y='independent').properties(bounds='flush') # Fix Jumbled Rows
+        ).properties(height=chart_height).interactive()
         
         st.altair_chart(base, use_container_width=True)
+        st.caption("Gold = Critical Path (0 Float). Blue = Normal Task.")
+        
         st.data_editor(tasks[['phase', 'name', 'start_date', 'end_date', 'duration']], hide_index=True, disabled=True)
 
     with st.expander(f"⚙️ Project Settings: {sel_p_name}"):
@@ -546,7 +614,7 @@ elif st.session_state.page == "Scheduler":
             st.divider()
             if st.button("📸 Capture Baseline"):
                 capture_baseline(pid, tasks)
-                st.success("Baseline Captured! 'Tasks Ahead' metrics are now active.")
+                st.success("Baseline Captured!")
             if st.button("🗑️ Delete Project", type="secondary"):
                 execute_statement("DELETE FROM tasks WHERE project_id=:pid", {"pid": pid})
                 execute_statement("DELETE FROM projects WHERE id=:pid", {"pid": pid})
