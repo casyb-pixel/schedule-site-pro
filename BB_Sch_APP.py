@@ -221,13 +221,26 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_da
     selected_task_id = task_id_to_edit
     t_data = {'name': "New Task", 'phase': 'Pre-Construction', 'duration': 1, 'start_date_override': project_start_date, 'subcontractor_id': 0, 'dependencies': "[]", 'exposure': 'Outdoor', 'material_lead_time': 0, 'material_status': 'Not Ordered', 'inspection_required': 0, 'percent_complete': 0}
 
+    # --- FIX 1: CALCULATE DATES BEFORE SORTING ---
     if mode == 'edit' and selected_task_id is None:
-        # --- UPDATE 1: SORT BY START_DATE ---
-        all_tasks = run_query("SELECT id, name, phase, start_date FROM tasks WHERE project_id=:pid ORDER BY start_date ASC, id ASC", {"pid": project_id})
-        if all_tasks.empty: st.warning("No tasks to edit."); return
+        # Get RAW tasks
+        all_tasks_raw = run_query("SELECT * FROM tasks WHERE project_id=:pid", {"pid": project_id})
         
-        # Create a clearer label with the date
-        t_options = {row['id']: f"{row['start_date']} | {row['name']}" for _, row in all_tasks.iterrows()}
+        if all_tasks_raw.empty:
+            st.warning("No tasks to edit.")
+            return
+
+        # Calculate dates in Python so we have 'start_date'
+        # We need the blocked dates for accuracy, fetch them quickly
+        pj_q = run_query("SELECT non_working_days FROM projects WHERE id=:pid", {"pid": project_id})
+        blocked = pj_q.iloc[0]['non_working_days'] if not pj_q.empty else "[]"
+        
+        all_tasks_calc = calculate_schedule_dates(all_tasks_raw, project_start_date, blocked)
+        
+        # Now we can sort by the calculated 'start_date'
+        all_tasks_calc = all_tasks_calc.sort_values(by=['start_date', 'id'])
+        
+        t_options = {row['id']: f"{row['start_date']} | {row['name']}" for _, row in all_tasks_calc.iterrows()}
         selected_task_id = st.selectbox("Select Task to Edit", options=t_options.keys(), format_func=lambda x: t_options[x])
         st.divider()
 
@@ -512,7 +525,7 @@ elif st.session_state.page == "Scheduler":
         st.altair_chart(base, use_container_width=True)
         st.caption("Gold = Critical Path. Blue = Standard Task.")
 
-        # --- UPDATE 2: INTERACTIVE PERCENT COMPLETE TABLE ---
+        # --- FIX 2: ENABLE EDITING BY USING NUMBER COLUMN ---
         editor_df = tasks[['id', 'phase', 'name', 'start_date', 'end_date', 'percent_complete']].copy()
         edited_df = st.data_editor(
             editor_df,
@@ -520,22 +533,23 @@ elif st.session_state.page == "Scheduler":
             use_container_width=True,
             key="scheduler_editor",
             column_config={
-                "id": None, # Hide ID
+                "id": None, 
                 "phase": st.column_config.TextColumn("Phase", disabled=True),
                 "name": st.column_config.TextColumn("Task Name", disabled=True),
                 "start_date": st.column_config.DateColumn("Start", disabled=True),
                 "end_date": st.column_config.DateColumn("End", disabled=True),
-                "percent_complete": st.column_config.ProgressColumn(
+                # Using NumberColumn allows direct editing
+                "percent_complete": st.column_config.NumberColumn(
                     "% Done", 
                     min_value=0, 
                     max_value=100, 
+                    step=5,
                     format="%d%%",
-                    width="medium"
+                    help="Enter a value between 0 and 100"
                 )
             }
         )
 
-        # Logic to save changes from table immediately
         if st.session_state.get("scheduler_editor") and st.session_state["scheduler_editor"].get("edited_rows"):
             updates = st.session_state["scheduler_editor"]["edited_rows"]
             for index, changes in updates.items():
