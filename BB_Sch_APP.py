@@ -534,6 +534,17 @@ with st.sidebar:
         if COOKIE_MANAGER_AVAILABLE: cm.delete("bb_user")
         st.session_state.clear(); st.rerun()
 
+        st.divider()
+
+# Donation Section
+st.markdown("### ☕ Support the Dev")
+st.write("Enjoying ScheduleSite Pro? Consider supporting its development.")
+
+# REPLACE THE URL BELOW with the one you just copied from Stripe
+stripe_link = "https://donate.stripe.com/4gMcN47eKc2wgPVfHNawo00" 
+
+st.link_button("❤️ Donate via Stripe", stripe_link, type="primary")
+
     st.divider()
     sim_date = st.date_input("📆 Simulation Date", value=datetime.date.today(), help="Use this to test alerts for future project dates.")
 
