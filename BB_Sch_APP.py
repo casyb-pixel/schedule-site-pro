@@ -109,7 +109,7 @@ def init_db():
 
 init_db()
 
-# --- 5. SCHEDULE LOGIC (Business Days + Recursive Critical Path) ---
+# --- 5. SCHEDULE LOGIC ---
 def add_business_days(start_date, days_to_add, blocked_dates_set):
     current_date = start_date
     while current_date.weekday() >= 5 or str(current_date) in blocked_dates_set:
@@ -142,7 +142,6 @@ def calculate_schedule_dates(tasks_df, project_start_date_str, blocked_dates_jso
         try: t['dep_list'] = [int(x) for x in json.loads(t['dependencies'])]
         except: t['dep_list'] = []
 
-    # Iterate to push dates based on dependencies
     for _ in range(len(tasks)): 
         changed = False
         for t in tasks:
@@ -212,7 +211,6 @@ def capture_baseline(project_id, tasks_df):
 # --- 6. PDF GENERATION LOGIC ---
 class PDFReport(FPDF):
     def header(self):
-        # Logo - using external URL
         try:
             self.image('https://balanceandbuildconsulting.com/wp-content/uploads/2026/01/ScheduleSite-Pro-Logo.png', 10, 8, 33)
         except:
@@ -220,7 +218,6 @@ class PDFReport(FPDF):
             self.cell(33, 10, 'ScheduleSite Pro', 0, 0, 'C')
             
         self.set_font('Arial', 'B', 15)
-        # Move to the right
         self.cell(80)
         self.cell(30, 10, 'Project Status Report', 0, 0, 'C')
         self.ln(20)
@@ -237,7 +234,7 @@ def generate_pdf_report(project, tasks_df, delay_df, upcoming_count, completion_
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=15)
     
-    # 1. Project Info Header
+    # 1. Project Info
     pdf.set_font("Arial", 'B', 12)
     pdf.set_fill_color(240, 240, 240)
     pdf.cell(0, 10, f"Project: {project['name']}", 0, 1, 'L', fill=True)
@@ -252,33 +249,27 @@ def generate_pdf_report(project, tasks_df, delay_df, upcoming_count, completion_
     pdf.cell(95, 20, f"Tasks Starting (2 Wks): {upcoming_count}", 1, 1, 'C')
     pdf.ln(10)
 
-    # 3. Generate Static Charts using Matplotlib
-    # Pie Chart Data
+    # 3. Charts
     completed = tasks_df[tasks_df['percent_complete'] == 100]['duration'].sum()
     in_prog = tasks_df[(tasks_df['percent_complete'] > 0) & (tasks_df['percent_complete'] < 100)]['duration'].sum()
     upcoming = tasks_df[tasks_df['percent_complete'] == 0]['duration'].sum()
     
-    # Create Matplotlib Figure for Pie
     fig1, ax1 = plt.subplots(figsize=(4, 3))
     ax1.pie([completed, in_prog, upcoming], labels=['Completed', 'In Progress', 'Upcoming'], 
             colors=['#28a745', '#17a2b8', '#6c757d'], autopct='%1.1f%%', startangle=90)
     ax1.axis('equal')
     ax1.set_title("Progress (Time Allocated)")
     
-    # Save Pie to buffer
     img_buf1 = io.BytesIO()
     plt.savefig(img_buf1, format='png', dpi=100, bbox_inches='tight')
     plt.close(fig1)
 
-    # Variance Data
     PHASE_ORDER = ["Pre-Construction", "Site Work", "Foundation", "Framing", "Exterior Building", "Interior Building", "Paving & Parking", "Final Systems and Testing", "Punchlist & Closeout"]
     tasks_df['phase_idx'] = tasks_df['phase'].apply(lambda x: PHASE_ORDER.index(x) if x in PHASE_ORDER else 99)
     phase_var = tasks_df.groupby('phase')['variance'].max().reset_index()
-    # Sort for chart
     phase_var['sort_idx'] = phase_var['phase'].apply(lambda x: PHASE_ORDER.index(x) if x in PHASE_ORDER else 99)
     phase_var = phase_var.sort_values('sort_idx')
 
-    # Create Matplotlib Figure for Bar
     fig2, ax2 = plt.subplots(figsize=(5, 3))
     colors = ['#d9534f' if v > 0 else '#28a745' for v in phase_var['variance']]
     ax2.bar(phase_var['phase'], phase_var['variance'], color=colors)
@@ -287,18 +278,15 @@ def generate_pdf_report(project, tasks_df, delay_df, upcoming_count, completion_
     plt.xticks(rotation=45, ha='right', fontsize=8)
     plt.tight_layout()
 
-    # Save Bar to buffer
     img_buf2 = io.BytesIO()
     plt.savefig(img_buf2, format='png', dpi=100, bbox_inches='tight')
     plt.close(fig2)
 
-    # Embed Images in PDF
-    # Determine x positions to side-by-side
     pdf.image(img_buf1, x=10, y=pdf.get_y(), w=90)
     pdf.image(img_buf2, x=110, y=pdf.get_y(), w=90)
-    pdf.ln(80) # Move down past images
+    pdf.ln(80) 
 
-    # 4. Delay Log Table
+    # 4. Delay Table
     pdf.add_page()
     pdf.set_font("Arial", 'B', 14)
     pdf.cell(0, 10, "Delay Event Log", 0, 1, 'L')
@@ -308,32 +296,25 @@ def generate_pdf_report(project, tasks_df, delay_df, upcoming_count, completion_
         pdf.set_font("Arial", 'I', 10)
         pdf.cell(0, 10, "No delays recorded.", 0, 1, 'L')
     else:
-        # Table Header
         pdf.set_font("Arial", 'B', 10)
-        pdf.set_fill_color(43, 88, 141) # Dark Blue
+        pdf.set_fill_color(43, 88, 141)
         pdf.set_text_color(255)
-        
-        # Cols: Date (30), Reason (30), Days (20), Notes (Rest)
         pdf.cell(30, 8, "Date", 1, 0, 'C', True)
         pdf.cell(30, 8, "Reason", 1, 0, 'C', True)
         pdf.cell(20, 8, "Days", 1, 0, 'C', True)
         pdf.cell(0, 8, "Notes / Affected", 1, 1, 'C', True)
         
-        # Table Body
         pdf.set_text_color(0)
         pdf.set_font("Arial", '', 9)
-        
         for _, row in delay_df.iterrows():
             desc = row.get('description') or ""
-            # Truncate desc if too long for simple cell, or use multi_cell (complex in fpdf without strict height calc)
-            # For simplicity, we truncate to ~60 chars
             clean_desc = (desc[:75] + '...') if len(desc) > 75 else desc
-            
             pdf.cell(30, 8, str(row['event_date']), 1, 0, 'C')
             pdf.cell(30, 8, str(row['reason']), 1, 0, 'C')
             pdf.cell(20, 8, str(row['days_lost']), 1, 0, 'C')
             pdf.cell(0, 8, clean_desc, 1, 1, 'L')
 
+    # FIX: Return bytes directly, not encoded string
     return bytes(pdf.output())
 
 # --- 7. POPUPS ---
@@ -634,12 +615,14 @@ if st.session_state.page == "Dashboard":
             
             st.divider()
             
-            # --- PDF GENERATOR BUTTON ---
+            # --- FIX: Button Logic for PDF ---
             if st.button("📄 Generate PDF Report"):
                 pdf_bytes = generate_pdf_report(curr_proj, tasks, delays, upcoming_count, final_date)
-                st.download_button("Download Report", data=pdf_bytes, file_name=f"Report_{curr_proj['name']}_{datetime.date.today()}.pdf", mime='application/pdf')
+                st.session_state.pdf_data = pdf_bytes # Store in session state
 
-            # --- ALERT LOGIC ---
+            if 'pdf_data' in st.session_state:
+                st.download_button("Click to Download Report", data=st.session_state.pdf_data, file_name=f"Report_{curr_proj['name']}_{datetime.date.today()}.pdf", mime='application/pdf')
+
             st.subheader(f"⚠️ Action Required (As of {sim_date})")
             
             alerts_found = False
@@ -651,7 +634,6 @@ if st.session_state.page == "Dashboard":
                 if lead > 0 and status not in ['Ordered', 'Delivered', 'Installed', 'N/A']:
                     start_dt = pd.to_datetime(t['start_date']).date()
                     must_order_by = start_dt - datetime.timedelta(days=lead)
-                    
                     days_until_drop_dead = (must_order_by - sim_date).days
                     
                     alert_html = None
