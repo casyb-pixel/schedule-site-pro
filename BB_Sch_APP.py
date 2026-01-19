@@ -225,11 +225,11 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_da
     t_data = {'name': "New Task", 'phase': 'Pre-Construction', 'duration': 1, 'start_date_override': project_start_date, 'subcontractor_id': 0, 'dependencies': "[]", 'exposure': 'Outdoor', 'material_lead_time': 0, 'material_status': 'Not Ordered', 'inspection_required': 0, 'percent_complete': 0}
 
     if mode == 'edit' and selected_task_id is None:
-        all_tasks = run_query("SELECT id, name, phase FROM tasks WHERE project_id=:pid ORDER BY phase, id", {"pid": project_id})
-        if all_tasks.empty: st.warning("No tasks to edit."); return
-        t_options = {row['id']: f"{row['phase']} - {row['name']}" for _, row in all_tasks.iterrows()}
-        selected_task_id = st.selectbox("Select Task to Edit", options=t_options.keys(), format_func=lambda x: t_options[x])
-        st.divider()
+    # UPDATED: ORDER BY start_date ensures list matches the timeline view
+    all_tasks = run_query("SELECT id, name, phase, start_date FROM tasks WHERE project_id=:pid ORDER BY start_date ASC, id ASC", {"pid": project_id})
+    if all_tasks.empty: st.warning("No tasks to edit."); return
+    # UPDATED: Included Date in label for clarity
+    t_options = {row['id']: f"{row['start_date']} | {row['name']}" for _, row in all_tasks.iterrows()}
 
     if selected_task_id:
         q = run_query("SELECT * FROM tasks WHERE id=:id", {"id": selected_task_id})
@@ -511,8 +511,54 @@ elif st.session_state.page == "Scheduler":
         ).properties(height=chart_height).interactive()
         
         st.altair_chart(base, use_container_width=True)
-        st.caption("Gold = Critical Path. Blue = Standard Task.")
-        st.data_editor(tasks[['phase', 'name', 'start_date', 'end_date', 'duration']], hide_index=True, disabled=True)
+st.caption("Gold = Critical Path. Blue = Standard Task.")
+
+# UPDATED: Interactive Data Editor for Percent Complete
+# 1. Prepare data: Include ID (hidden) and Percent Complete
+editor_df = tasks[['id', 'phase', 'name', 'start_date', 'end_date', 'percent_complete']].copy()
+
+# 2. Configure the editor
+edited_df = st.data_editor(
+    editor_df,
+    hide_index=True,
+    use_container_width=True,
+    key="scheduler_editor",
+    column_config={
+        "id": None, # Hide ID column
+        "phase": st.column_config.TextColumn("Phase", disabled=True),
+        "name": st.column_config.TextColumn("Task Name", disabled=True),
+        "start_date": st.column_config.DateColumn("Start", disabled=True),
+        "end_date": st.column_config.DateColumn("End", disabled=True),
+        "percent_complete": st.column_config.ProgressColumn(
+            "% Done", 
+            min_value=0, 
+            max_value=100, 
+            format="%d%%",
+            width="medium" # Makes the bar easier to click
+        )
+    }
+)
+
+# 3. Save Logic: Detect changes and update DB immediately
+# Check if edits exist in session state
+if st.session_state.get("scheduler_editor") and st.session_state["scheduler_editor"].get("edited_rows"):
+    updates = st.session_state["scheduler_editor"]["edited_rows"]
+    
+    # Iterate through changes
+    for index, changes in updates.items():
+        if "percent_complete" in changes:
+            # Get the Task ID from the original dataframe using the index
+            task_id_to_update = int(editor_df.iloc[index]['id'])
+            new_pct = int(changes['percent_complete'])
+            
+            # Write to DB
+            execute_statement(
+                "UPDATE tasks SET percent_complete=:pc WHERE id=:id", 
+                {"pc": new_pct, "id": task_id_to_update}
+            )
+    
+    # Optional: Force a refresh to sync state (prevents "ghost" edits)
+    # st.rerun()
 
     with st.expander(f"⚙️ Project Settings: {sel_p_name}"):
         with st.form("edit_p"):
