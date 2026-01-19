@@ -4,6 +4,9 @@ import datetime
 import time
 import json
 import altair as alt
+import matplotlib.pyplot as plt
+import io
+from fpdf import FPDF
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 
@@ -35,12 +38,11 @@ st.markdown("""
         display: flex; flex-direction: column; justify-content: center;
     }
     
-    /* NEW: Scrollable Task List Card */
     .task-list-card {
         background-color: white; padding: 15px; border-radius: 12px;
         box-shadow: 0 4px 6px rgba(0,0,0,0.05);
         border-top: 5px solid #2B588D; margin-bottom: 15px; height: 140px;
-        overflow-y: auto; /* Allows scrolling if list is long */
+        overflow-y: auto; 
     }
     .task-list-item {
         font-size: 0.85rem; border-bottom: 1px solid #f0f0f0; padding: 4px 0; text-align: left;
@@ -141,7 +143,7 @@ def calculate_schedule_dates(tasks_df, project_start_date_str, blocked_dates_jso
         except: t['dep_list'] = []
 
     # Iterate to push dates based on dependencies
-    for _ in range(len(tasks)): # Sufficient iterations for depth
+    for _ in range(len(tasks)): 
         changed = False
         for t in tasks:
             if not t['dep_list']: new_start = t['early_start']
@@ -158,38 +160,30 @@ def calculate_schedule_dates(tasks_df, project_start_date_str, blocked_dates_jso
                 changed = True
         if not changed: break
     
-    # 2. CRITICAL PATH IDENTIFICATION (Recursive Back-Tracing)
+    # 2. CRITICAL PATH
     max_finish = max(t['early_finish'] for t in tasks) if tasks else proj_start
-    
-    # Map successors
     successors = {t['id']: [] for t in tasks}
     for t in tasks:
-        t['is_critical'] = False # Reset
+        t['is_critical'] = False 
         for dep in t['dep_list']:
             if dep in successors: successors[dep].append(t['id'])
     
-    # Step A: Identify Terminal Critical Tasks (Finish on Max Date)
     for t in tasks:
         if t['early_finish'] >= max_finish:
             t['is_critical'] = True
             
-    # Step B: Propagate Criticality Backwards
     sorted_tasks = sorted(tasks, key=lambda x: x['early_finish'], reverse=True)
-    
     for t in sorted_tasks:
         for succ_id in successors[t['id']]:
             succ = task_map[succ_id]
             if succ['is_critical']:
-                # Do I finish exactly when they need to start (or very close)?
                 if t['early_finish'] >= succ['early_start']:
                     t['is_critical'] = True
 
-    # 3. FINALIZE & FORMAT
+    # 3. FINALIZE
     for t in tasks:
         t['start_date'] = t['early_start'].strftime('%Y-%m-%d')
         t['end_date'] = t['early_finish'].strftime('%Y-%m-%d')
-        
-        # Variance
         t['variance'] = 0
         if t.get('baseline_end_date'):
             try:
@@ -204,7 +198,6 @@ def capture_baseline(project_id, tasks_df):
     try:
         with engine.begin() as conn:
             for _, row in tasks_df.iterrows():
-                # Explicit string conversion for SQL safety
                 s_str = str(row['start_date'])
                 e_str = str(row['end_date'])
                 t_id = int(row['id'])
@@ -216,7 +209,134 @@ def capture_baseline(project_id, tasks_df):
     except Exception as e:
         st.error(f"Database Error during capture: {e}")
 
-# --- 6. POPUPS ---
+# --- 6. PDF GENERATION LOGIC ---
+class PDFReport(FPDF):
+    def header(self):
+        # Logo - using external URL
+        try:
+            self.image('https://balanceandbuildconsulting.com/wp-content/uploads/2026/01/ScheduleSite-Pro-Logo.png', 10, 8, 33)
+        except:
+            self.set_font('Arial', 'B', 12)
+            self.cell(33, 10, 'ScheduleSite Pro', 0, 0, 'C')
+            
+        self.set_font('Arial', 'B', 15)
+        # Move to the right
+        self.cell(80)
+        self.cell(30, 10, 'Project Status Report', 0, 0, 'C')
+        self.ln(20)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font('Arial', 'I', 8)
+        self.set_text_color(128)
+        self.cell(0, 10, 'ScheduleSite Pro - Powered by Balance & Build Consulting', 0, 0, 'C')
+        self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'R')
+
+def generate_pdf_report(project, tasks_df, delay_df, upcoming_count, completion_date):
+    pdf = PDFReport()
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    
+    # 1. Project Info Header
+    pdf.set_font("Arial", 'B', 12)
+    pdf.set_fill_color(240, 240, 240)
+    pdf.cell(0, 10, f"Project: {project['name']}", 0, 1, 'L', fill=True)
+    pdf.set_font("Arial", '', 10)
+    pdf.cell(0, 8, f"Client: {project['client_name']}", 0, 1, 'L')
+    pdf.cell(0, 8, f"Report Date: {datetime.date.today()}", 0, 1, 'L')
+    pdf.ln(5)
+
+    # 2. Key Metrics
+    pdf.set_font("Arial", 'B', 12)
+    pdf.cell(95, 20, f"Est. Completion: {completion_date}", 1, 0, 'C')
+    pdf.cell(95, 20, f"Tasks Starting (2 Wks): {upcoming_count}", 1, 1, 'C')
+    pdf.ln(10)
+
+    # 3. Generate Static Charts using Matplotlib
+    # Pie Chart Data
+    completed = tasks_df[tasks_df['percent_complete'] == 100]['duration'].sum()
+    in_prog = tasks_df[(tasks_df['percent_complete'] > 0) & (tasks_df['percent_complete'] < 100)]['duration'].sum()
+    upcoming = tasks_df[tasks_df['percent_complete'] == 0]['duration'].sum()
+    
+    # Create Matplotlib Figure for Pie
+    fig1, ax1 = plt.subplots(figsize=(4, 3))
+    ax1.pie([completed, in_prog, upcoming], labels=['Completed', 'In Progress', 'Upcoming'], 
+            colors=['#28a745', '#17a2b8', '#6c757d'], autopct='%1.1f%%', startangle=90)
+    ax1.axis('equal')
+    ax1.set_title("Progress (Time Allocated)")
+    
+    # Save Pie to buffer
+    img_buf1 = io.BytesIO()
+    plt.savefig(img_buf1, format='png', dpi=100, bbox_inches='tight')
+    plt.close(fig1)
+
+    # Variance Data
+    PHASE_ORDER = ["Pre-Construction", "Site Work", "Foundation", "Framing", "Exterior Building", "Interior Building", "Paving & Parking", "Final Systems and Testing", "Punchlist & Closeout"]
+    tasks_df['phase_idx'] = tasks_df['phase'].apply(lambda x: PHASE_ORDER.index(x) if x in PHASE_ORDER else 99)
+    phase_var = tasks_df.groupby('phase')['variance'].max().reset_index()
+    # Sort for chart
+    phase_var['sort_idx'] = phase_var['phase'].apply(lambda x: PHASE_ORDER.index(x) if x in PHASE_ORDER else 99)
+    phase_var = phase_var.sort_values('sort_idx')
+
+    # Create Matplotlib Figure for Bar
+    fig2, ax2 = plt.subplots(figsize=(5, 3))
+    colors = ['#d9534f' if v > 0 else '#28a745' for v in phase_var['variance']]
+    ax2.bar(phase_var['phase'], phase_var['variance'], color=colors)
+    ax2.set_title("Schedule Variance by Phase")
+    ax2.set_ylabel("Days Variance")
+    plt.xticks(rotation=45, ha='right', fontsize=8)
+    plt.tight_layout()
+
+    # Save Bar to buffer
+    img_buf2 = io.BytesIO()
+    plt.savefig(img_buf2, format='png', dpi=100, bbox_inches='tight')
+    plt.close(fig2)
+
+    # Embed Images in PDF
+    # Determine x positions to side-by-side
+    pdf.image(img_buf1, x=10, y=pdf.get_y(), w=90)
+    pdf.image(img_buf2, x=110, y=pdf.get_y(), w=90)
+    pdf.ln(80) # Move down past images
+
+    # 4. Delay Log Table
+    pdf.add_page()
+    pdf.set_font("Arial", 'B', 14)
+    pdf.cell(0, 10, "Delay Event Log", 0, 1, 'L')
+    pdf.ln(5)
+
+    if delay_df.empty:
+        pdf.set_font("Arial", 'I', 10)
+        pdf.cell(0, 10, "No delays recorded.", 0, 1, 'L')
+    else:
+        # Table Header
+        pdf.set_font("Arial", 'B', 10)
+        pdf.set_fill_color(43, 88, 141) # Dark Blue
+        pdf.set_text_color(255)
+        
+        # Cols: Date (30), Reason (30), Days (20), Notes (Rest)
+        pdf.cell(30, 8, "Date", 1, 0, 'C', True)
+        pdf.cell(30, 8, "Reason", 1, 0, 'C', True)
+        pdf.cell(20, 8, "Days", 1, 0, 'C', True)
+        pdf.cell(0, 8, "Notes / Affected", 1, 1, 'C', True)
+        
+        # Table Body
+        pdf.set_text_color(0)
+        pdf.set_font("Arial", '', 9)
+        
+        for _, row in delay_df.iterrows():
+            desc = row.get('description') or ""
+            # Truncate desc if too long for simple cell, or use multi_cell (complex in fpdf without strict height calc)
+            # For simplicity, we truncate to ~60 chars
+            clean_desc = (desc[:75] + '...') if len(desc) > 75 else desc
+            
+            pdf.cell(30, 8, str(row['event_date']), 1, 0, 'C')
+            pdf.cell(30, 8, str(row['reason']), 1, 0, 'C')
+            pdf.cell(20, 8, str(row['days_lost']), 1, 0, 'C')
+            pdf.cell(0, 8, clean_desc, 1, 1, 'L')
+
+    return pdf.output(dest='S').encode('latin-1')
+
+# --- 7. POPUPS ---
 if hasattr(st, 'dialog'): dialog_decorator = st.dialog
 elif hasattr(st, 'experimental_dialog'): dialog_decorator = st.experimental_dialog
 else:
@@ -235,17 +355,11 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_da
 
     if mode == 'edit' and selected_task_id is None:
         all_tasks_raw = run_query("SELECT * FROM tasks WHERE project_id=:pid", {"pid": project_id})
-        
-        if all_tasks_raw.empty:
-            st.warning("No tasks to edit.")
-            return
-
+        if all_tasks_raw.empty: st.warning("No tasks to edit."); return
         pj_q = run_query("SELECT non_working_days FROM projects WHERE id=:pid", {"pid": project_id})
         blocked = pj_q.iloc[0]['non_working_days'] if not pj_q.empty else "[]"
-        
         all_tasks_calc = calculate_schedule_dates(all_tasks_raw, project_start_date, blocked)
         all_tasks_calc = all_tasks_calc.sort_values(by=['start_date', 'id'])
-        
         t_options = {row['id']: f"{row['start_date']} | {row['name']}" for _, row in all_tasks_calc.iterrows()}
         selected_task_id = st.selectbox("Select Task to Edit", options=t_options.keys(), format_func=lambda x: t_options[x])
         st.divider()
@@ -315,14 +429,9 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_da
             ph = sel_phase if sel_phase != "Custom" else "General"
             insp_int = 1 if insp else 0
             
-            # Smart status logic
             current_stat = t_data.get('material_status')
             if not current_stat: current_stat = 'Not Ordered'
-            
-            if lead_time == 0:
-                final_mat_status = 'Delivered'
-            else:
-                final_mat_status = current_stat
+            final_mat_status = 'Delivered' if lead_time == 0 else current_stat
 
             if selected_task_id:
                 execute_statement("UPDATE tasks SET name=:n, phase=:p, duration=:d, start_date_override=:ov, subcontractor_id=:s, dependencies=:dep, exposure=:ex, material_lead_time=:mlt, material_status=:ms, inspection_required=:ir, percent_complete=:pc WHERE id=:id",
@@ -444,7 +553,6 @@ with st.sidebar:
         if COOKIE_MANAGER_AVAILABLE: cm.delete("bb_user")
         st.session_state.clear(); st.rerun()
 
-    # --- SIMULATION DATE ---
     st.divider()
     sim_date = st.date_input("📆 Simulation Date", value=datetime.date.today(), help="Use this to test alerts for future project dates.")
 
@@ -469,10 +577,10 @@ if st.session_state.page == "Dashboard":
         with tab_dash:
             final_date = pd.to_datetime(tasks['end_date']).max().strftime('%b %d, %Y')
             
-            # --- METRIC 2: LIST OF TASKS STARTING IN NEXT 2 WEEKS ---
             two_weeks_out = sim_date + datetime.timedelta(days=14)
             tasks['start_dt_obj'] = pd.to_datetime(tasks['start_date']).dt.date
             upcoming_tasks_df = tasks[ (tasks['start_dt_obj'] >= sim_date) & (tasks['start_dt_obj'] <= two_weeks_out) ]
+            upcoming_count = len(upcoming_tasks_df)
             
             if upcoming_tasks_df.empty:
                 list_html = "<div style='color:#999; font-style:italic; padding:10px;'>No upcoming tasks</div>"
@@ -482,7 +590,6 @@ if st.session_state.page == "Dashboard":
 
             c1, c2 = st.columns(2)
             c1.markdown(f"<div class='metric-card'><div class='metric-value'>{final_date}</div><div class='metric-label'>Completion</div></div>", unsafe_allow_html=True)
-            # Use the new Scrollable Card Style
             c2.markdown(f"""
                 <div class='task-list-card'>
                     <div class='metric-label' style='margin-bottom:8px; border-bottom:2px solid #eee; padding-bottom:5px;'>Starting (Next 14 Days)</div>
@@ -492,7 +599,6 @@ if st.session_state.page == "Dashboard":
             
             st.divider()
             
-            # Chart 1: Progress Pie Chart
             completed_dur = tasks[tasks['percent_complete'] == 100]['duration'].sum()
             in_progress_dur = tasks[(tasks['percent_complete'] > 0) & (tasks['percent_complete'] < 100)]['duration'].sum()
             upcoming_dur = tasks[tasks['percent_complete'] == 0]['duration'].sum()
@@ -509,10 +615,8 @@ if st.session_state.page == "Dashboard":
                 tooltip=["Status", "Duration"]
             ).properties(title="Project Progress (Time Allocated)")
 
-            # Chart 2: HIGH LEVEL VARIANCE CHART (BY PHASE)
             PHASE_ORDER = ["Pre-Construction", "Site Work", "Foundation", "Framing", "Exterior Building", "Interior Building", "Paving & Parking", "Final Systems and Testing", "Punchlist & Closeout"]
             tasks['phase_idx'] = tasks['phase'].apply(lambda x: PHASE_ORDER.index(x) if x in PHASE_ORDER else 99)
-            
             phase_var = tasks.groupby(['phase', 'phase_idx'])['variance'].max().reset_index()
             phase_var = phase_var.sort_values('phase_idx')
             phase_var['color'] = phase_var['variance'].apply(lambda x: '#d9534f' if x > 0 else '#28a745')
@@ -529,8 +633,13 @@ if st.session_state.page == "Dashboard":
             vc2.altair_chart(var_chart, use_container_width=True)
             
             st.divider()
+            
+            # --- PDF GENERATOR BUTTON ---
+            if st.button("📄 Generate PDF Report"):
+                pdf_bytes = generate_pdf_report(curr_proj, tasks, delays, upcoming_count, final_date)
+                st.download_button("Download Report", data=pdf_bytes, file_name=f"Report_{curr_proj['name']}_{datetime.date.today()}.pdf", mime='application/pdf')
 
-            # --- ALERT LOGIC (with Simulation Date) ---
+            # --- ALERT LOGIC ---
             st.subheader(f"⚠️ Action Required (As of {sim_date})")
             
             alerts_found = False
@@ -539,7 +648,6 @@ if st.session_state.page == "Dashboard":
                 status = t.get('material_status')
                 if not status or status == 'None': status = 'Not Ordered'
                 
-                # Exclude if already ordered/delivered
                 if lead > 0 and status not in ['Ordered', 'Delivered', 'Installed', 'N/A']:
                     start_dt = pd.to_datetime(t['start_date']).date()
                     must_order_by = start_dt - datetime.timedelta(days=lead)
@@ -593,13 +701,11 @@ if st.session_state.page == "Dashboard":
             t_name = run_query("SELECT name FROM tasks WHERE id=:id", {"id": tid}).iloc[0]['name']
             st.write(f"**Task:** {t_name}")
             with st.form("ord_f"):
-                # --- UPDATE: Added Date Field ---
                 ord_date = st.date_input("Date Ordered", value=datetime.date.today())
                 vend = st.text_input("Vendor / Supplier")
                 po = st.text_input("PO Number")
                 notes = st.text_area("Notes / Communication")
                 if st.form_submit_button("✅ Confirm Order"):
-                    # --- UPDATE: Saving Order Date to DB ---
                     execute_statement("""
                         UPDATE tasks 
                         SET material_status='Ordered', material_vendor=:v, material_po=:p, material_notes=:n, material_order_date=:d 
@@ -608,7 +714,6 @@ if st.session_state.page == "Dashboard":
                     
                     st.success("Updated!")
                     st.session_state.active_popup = None
-                    # Clear cache to ensure next query picks up new status and sleep for commit
                     st.cache_resource.clear()
                     time.sleep(0.5) 
                     st.rerun()
@@ -643,7 +748,6 @@ elif st.session_state.page == "Scheduler":
     tasks = calculate_schedule_dates(tasks, curr_proj['start_date'], p_blocked)
     
     if not tasks.empty:
-        # --- COLOR LOGIC: Green for 100%, Gold for Critical, Blue for Std ---
         def get_color(row):
             if row.get('percent_complete', 0) == 100: return '#28a745' 
             if row.get('is_critical'): return '#DAA520' 
@@ -651,7 +755,6 @@ elif st.session_state.page == "Scheduler":
             
         tasks['Color'] = tasks.apply(get_color, axis=1)
         
-        # Chart
         PHASE_ORDER = ["Pre-Construction", "Site Work", "Foundation", "Framing", "Exterior Building", "Interior Building", "Paving & Parking", "Final Systems and Testing", "Punchlist & Closeout"]
         p_map = {p: i for i, p in enumerate(PHASE_ORDER)}
         tasks['phase_order'] = tasks['phase'].map(p_map).fillna(99)
@@ -675,7 +778,6 @@ elif st.session_state.page == "Scheduler":
         st.altair_chart(base, use_container_width=True)
         st.caption("Green = Complete. Gold = Critical Path. Blue = Standard Task.")
 
-        # Table
         editor_df = tasks[['id', 'phase', 'name', 'start_date', 'end_date', 'percent_complete']].copy()
         edited_df = st.data_editor(
             editor_df,
