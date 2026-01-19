@@ -324,22 +324,28 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_da
 
 @dialog_decorator("Log Delay")
 def delay_popup(project_id, project_start_date, blocked_dates_json):
+    # --- FIX 2: RE-CALCULATE DATES INSIDE POPUP ---
     tasks_raw = run_query("SELECT * FROM tasks WHERE project_id=:pid", {"pid": project_id})
     tasks = calculate_schedule_dates(tasks_raw, project_start_date, blocked_dates_json)
     
     with st.form("d_form"):
         date_input = st.date_input("Date", value=datetime.date.today())
         
-        # Filter Tasks
+        # Logic: Filter tasks that overlap with the selected date
         t_opts = {}
         if not tasks.empty:
             tasks['start_dt'] = pd.to_datetime(tasks['start_date']).dt.date
             tasks['end_dt'] = pd.to_datetime(tasks['end_date']).dt.date
+            # Simple overlap check: Task Start <= Selected <= Task End
             active = tasks[(tasks['start_dt'] <= date_input) & (tasks['end_dt'] >= date_input)]
-            t_opts = {row['id']: row['name'] for _, row in (active if not active.empty else tasks).iterrows()}
+            # If no tasks match the specific date, fall back to showing all tasks so user can manually pick
+            source = active if not active.empty else tasks
+            t_opts = {row['id']: row['name'] for _, row in source.iterrows()}
 
         reason = st.selectbox("Reason", ["Weather", "Material", "Inspection", "Other"])
         days = st.number_input("Days Lost", min_value=1)
+        # --- NEW: DESCRIPTION FIELD ---
+        notes = st.text_area("Notes")
         aff = st.multiselect("Affected Tasks", options=t_opts.keys(), format_func=lambda x: t_opts[x])
         
         mitigation = False
@@ -358,8 +364,9 @@ def delay_popup(project_id, project_start_date, blocked_dates_json):
             if not aff: st.error("Select tasks.")
             elif mitigation and not override: st.error("Review mitigation.")
             else:
-                execute_statement("INSERT INTO delay_events (project_id, reason, days_lost, affected_task_ids, event_date) VALUES (:pid, :r, :d, :a, :date)",
-                    {"pid": project_id, "r": reason, "d": days, "a": json.dumps(aff), "date": str(date_input)})
+                # --- UPDATE: INSERT WITH DESCRIPTION ---
+                execute_statement("INSERT INTO delay_events (project_id, reason, days_lost, affected_task_ids, event_date, description) VALUES (:pid, :r, :d, :a, :date, :desc)",
+                    {"pid": project_id, "r": reason, "d": days, "a": json.dumps(aff), "date": str(date_input), "desc": notes})
                 for tid in aff:
                     execute_statement("UPDATE tasks SET duration = duration + :d WHERE id=:tid", {"d": days, "tid": tid})
                 st.session_state.active_popup = None; st.rerun()
@@ -468,32 +475,25 @@ if st.session_state.page == "Dashboard":
             
             st.divider()
 
-            # --- UPDATED MATERIAL ALERTS ---
+            # --- UPDATED MATERIAL ALERTS LOGIC (Robust NULL Handling) ---
             st.subheader("⚠️ Action Required")
             today = datetime.date.today()
             
-            # Loop through tasks to check materials
             alerts_found = False
             for _, t in tasks.iterrows():
-                lead = t.get('material_lead_time', 0)
-                status = t.get('material_status', 'Not Ordered')
+                # FIX: Handle NULLs or Empty Strings safely
+                lead = t.get('material_lead_time') or 0
+                status = t.get('material_status')
+                if not status: status = 'Not Ordered'
                 
                 if lead > 0 and status == 'Not Ordered':
                     start_dt = pd.to_datetime(t['start_date']).date()
-                    
-                    # Math: 
-                    # Drop-dead order date = Start - Lead
-                    # Warning date = Drop-dead - 14
-                    
                     must_order_by = start_dt - datetime.timedelta(days=lead)
-                    days_overdue = (today - must_order_by).days # Positive means we are late
+                    days_overdue = (today - must_order_by).days
                     
                     alert_html = None
-                    # RED ALERT: We are PAST the drop-dead date or currently IN the lead time window
                     if today >= must_order_by:
                         alert_html = f"<div class='alert-red'>🔴 JEOPARDY: '{t['name']}' - Order IMMEDIATELY (Need {lead} days, starts {t['start_date']}).</div>"
-                    
-                    # YELLOW ALERT: We are within 14 days of the drop-dead date
                     elif today >= (must_order_by - datetime.timedelta(days=14)):
                         days_until_drop_dead = (must_order_by - today).days
                         alert_html = f"<div class='alert-yellow'>🟡 WARNING: '{t['name']}' - Order by {must_order_by} ({days_until_drop_dead} days left).</div>"
