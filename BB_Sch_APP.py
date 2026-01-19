@@ -431,6 +431,43 @@ if st.session_state.page == "Dashboard":
             c1.markdown(f"<div class='metric-card'><div class='metric-value'>{final_date}</div><div class='metric-label'>Completion</div></div>", unsafe_allow_html=True)
             c2.markdown(f"<div class='metric-card'><div class='metric-value'>{len(tasks[tasks['variance']<0])}</div><div class='metric-label'>Tasks Ahead</div></div>", unsafe_allow_html=True)
             
+            # --- NEW: VISUALIZATIONS ---
+            st.divider()
+            
+            # Chart 1: Progress Pie Chart
+            completed_dur = tasks[tasks['percent_complete'] == 100]['duration'].sum()
+            in_progress_dur = tasks[(tasks['percent_complete'] > 0) & (tasks['percent_complete'] < 100)]['duration'].sum()
+            upcoming_dur = tasks[tasks['percent_complete'] == 0]['duration'].sum()
+            
+            pie_data = pd.DataFrame({
+                'Status': ['Completed', 'In Progress', 'Upcoming'],
+                'Duration': [completed_dur, in_progress_dur, upcoming_dur],
+                'Color': ['#28a745', '#17a2b8', '#6c757d']
+            })
+            
+            pie_chart = alt.Chart(pie_data).mark_arc(innerRadius=50).encode(
+                theta=alt.Theta(field="Duration", type="quantitative"),
+                color=alt.Color(field="Status", type="nominal", scale=alt.Scale(domain=['Completed', 'In Progress', 'Upcoming'], range=['#28a745', '#17a2b8', '#6c757d'])),
+                tooltip=["Status", "Duration"]
+            ).properties(title="Project Progress (Time Allocated)")
+
+            # Chart 2: Baseline vs Actual (Variance)
+            # Create a simplified Variance Chart
+            tasks['variance_color'] = tasks['variance'].apply(lambda x: '#d9534f' if x > 0 else '#28a745') # Red if delayed, Green if ahead
+            
+            var_chart = alt.Chart(tasks).mark_bar().encode(
+                x=alt.X('name:N', sort=None, title='Task'),
+                y=alt.Y('variance:Q', title='Days Variance (Positive = Delayed)'),
+                color=alt.Color('variance_color', scale=None),
+                tooltip=['name', 'variance']
+            ).properties(title="Schedule Variance vs Baseline")
+
+            vc1, vc2 = st.columns(2)
+            vc1.altair_chart(pie_chart, use_container_width=True)
+            vc2.altair_chart(var_chart, use_container_width=True)
+            
+            st.divider()
+
             st.subheader("⚠️ Action Required")
             today = datetime.date.today()
             alerts = []
@@ -598,3 +635,4 @@ elif st.session_state.page == "Settings":
         cn = st.text_input("Company", value=user_data['company_name'] if user_data['company_name'] else "")
         if st.form_submit_button("Save"):
             execute_statement("UPDATE users SET company_name=:n WHERE id=:u", {"n": cn, "u": st.session_state.user_id}); st.success("Saved!")
+        
