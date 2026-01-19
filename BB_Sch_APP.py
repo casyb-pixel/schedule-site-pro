@@ -86,7 +86,7 @@ def init_db():
         conn.execute(text("CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, project_id INTEGER, phase TEXT, name TEXT, duration INTEGER, start_date_override TEXT, exposure TEXT DEFAULT 'Outdoor', material_lead_time INTEGER DEFAULT 0, material_status TEXT DEFAULT 'Not Ordered', inspection_required INTEGER DEFAULT 0, percent_complete INTEGER DEFAULT 0, dependencies TEXT, subcontractor_id INTEGER, baseline_start_date TEXT, baseline_end_date TEXT)"))
         
         # Migrations
-        for col in ['material_status', 'exposure', 'baseline_start_date', 'baseline_end_date']:
+        for col in ['material_status', 'exposure', 'baseline_start_date', 'baseline_end_date', 'material_vendor', 'material_po', 'material_notes']:
             try: conn.execute(text(f"ALTER TABLE tasks ADD COLUMN {col} TEXT"))
             except: pass
         for col in ['material_lead_time', 'inspection_required', 'percent_complete']:
@@ -282,7 +282,8 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_da
         c3, c4 = st.columns(2)
         exp_idx = 0 if t_data.get('exposure') == 'Outdoor' else 1
         exposure = c3.selectbox("Exposure", ["Outdoor", "Indoor"], index=exp_idx)
-        lead_time = c4.number_input("Lead Time (Days)", value=t_data.get('material_lead_time', 0))
+        # --- FIX: Updated Label ---
+        lead_time = c4.number_input("Material Delivery Lead Time (Days)", value=t_data.get('material_lead_time', 0))
         
         c5, c6 = st.columns(2)
         insp = c5.checkbox("Inspection Required?", value=(t_data.get('inspection_required', 0) == 1))
@@ -431,7 +432,7 @@ if st.session_state.page == "Dashboard":
             c1.markdown(f"<div class='metric-card'><div class='metric-value'>{final_date}</div><div class='metric-label'>Completion</div></div>", unsafe_allow_html=True)
             c2.markdown(f"<div class='metric-card'><div class='metric-value'>{len(tasks[tasks['variance']<0])}</div><div class='metric-label'>Tasks Ahead</div></div>", unsafe_allow_html=True)
             
-            # --- NEW: VISUALIZATIONS ---
+            # --- VISUALIZATIONS ---
             st.divider()
             
             # Chart 1: Progress Pie Chart
@@ -452,8 +453,7 @@ if st.session_state.page == "Dashboard":
             ).properties(title="Project Progress (Time Allocated)")
 
             # Chart 2: Baseline vs Actual (Variance)
-            # Create a simplified Variance Chart
-            tasks['variance_color'] = tasks['variance'].apply(lambda x: '#d9534f' if x > 0 else '#28a745') # Red if delayed, Green if ahead
+            tasks['variance_color'] = tasks['variance'].apply(lambda x: '#d9534f' if x > 0 else '#28a745') 
             
             var_chart = alt.Chart(tasks).mark_bar().encode(
                 x=alt.X('name:N', sort=None, title='Task'),
@@ -468,20 +468,45 @@ if st.session_state.page == "Dashboard":
             
             st.divider()
 
+            # --- UPDATED MATERIAL ALERTS ---
             st.subheader("⚠️ Action Required")
             today = datetime.date.today()
-            alerts = []
+            
+            # Loop through tasks to check materials
+            alerts_found = False
             for _, t in tasks.iterrows():
                 lead = t.get('material_lead_time', 0)
                 status = t.get('material_status', 'Not Ordered')
-                start_dt = pd.to_datetime(t['start_date']).date()
+                
                 if lead > 0 and status == 'Not Ordered':
-                    days = (start_dt - today).days
-                    if days <= lead: alerts.append(f"<div class='alert-red'>🔴 ORDER MATERIAL: '{t['name']}' ({days} days left).</div>")
-                    elif days <= lead+7: alerts.append(f"<div class='alert-yellow'>🟡 PREP ORDER: '{t['name']}'.</div>")
-            if not alerts: st.success("✅ No alerts.")
-            else: 
-                for a in alerts: st.markdown(a, unsafe_allow_html=True)
+                    start_dt = pd.to_datetime(t['start_date']).date()
+                    
+                    # Math: 
+                    # Drop-dead order date = Start - Lead
+                    # Warning date = Drop-dead - 14
+                    
+                    must_order_by = start_dt - datetime.timedelta(days=lead)
+                    days_overdue = (today - must_order_by).days # Positive means we are late
+                    
+                    alert_html = None
+                    # RED ALERT: We are PAST the drop-dead date or currently IN the lead time window
+                    if today >= must_order_by:
+                        alert_html = f"<div class='alert-red'>🔴 JEOPARDY: '{t['name']}' - Order IMMEDIATELY (Need {lead} days, starts {t['start_date']}).</div>"
+                    
+                    # YELLOW ALERT: We are within 14 days of the drop-dead date
+                    elif today >= (must_order_by - datetime.timedelta(days=14)):
+                        days_until_drop_dead = (must_order_by - today).days
+                        alert_html = f"<div class='alert-yellow'>🟡 WARNING: '{t['name']}' - Order by {must_order_by} ({days_until_drop_dead} days left).</div>"
+                    
+                    if alert_html:
+                        alerts_found = True
+                        ac1, ac2 = st.columns([5, 1])
+                        ac1.markdown(alert_html, unsafe_allow_html=True)
+                        if ac2.button("📦 Mark Ordered", key=f"btn_ord_{t['id']}"):
+                            st.session_state.active_popup = ('order_mat', t['id'])
+                            st.rerun()
+
+            if not alerts_found: st.success("✅ No material alerts.")
 
         with tab_wbs:
             PHASE_ORDER = ["Pre-Construction", "Site Work", "Foundation", "Framing", "Exterior Building", "Interior Building", "Paving & Parking", "Final Systems and Testing", "Punchlist & Closeout"]
@@ -498,6 +523,7 @@ if st.session_state.page == "Dashboard":
             tasks['WBS ID'] = wbs
             st.dataframe(tasks[['WBS ID', 'phase', 'name', 'duration', 'start_date', 'end_date', 'percent_complete', 'material_status']], use_container_width=True, hide_index=True)
 
+    # --- POPUP: LAUNCH ---
     if st.session_state.active_popup == 'launch_project':
         @dialog_decorator("🚀 Launch Project")
         def launch_popup():
@@ -506,6 +532,26 @@ if st.session_state.page == "Dashboard":
                 execute_statement("UPDATE projects SET start_date=:s, status='In Progress' WHERE id=:id", {"s": str(new_start), "id": pid})
                 st.success("Launched!"); st.session_state.active_popup = None; st.rerun()
         launch_popup()
+
+    # --- POPUP: ORDER MATERIAL ---
+    if isinstance(st.session_state.active_popup, tuple) and st.session_state.active_popup[0] == 'order_mat':
+        target_tid = st.session_state.active_popup[1]
+        @dialog_decorator("📦 Mark Material Ordered")
+        def order_popup(tid):
+            t_name = run_query("SELECT name FROM tasks WHERE id=:id", {"id": tid}).iloc[0]['name']
+            st.write(f"**Task:** {t_name}")
+            with st.form("ord_f"):
+                vend = st.text_input("Vendor / Supplier")
+                po = st.text_input("PO Number")
+                notes = st.text_area("Notes / Communication")
+                if st.form_submit_button("✅ Confirm Order"):
+                    execute_statement("""
+                        UPDATE tasks 
+                        SET material_status='Ordered', material_vendor=:v, material_po=:p, material_notes=:n 
+                        WHERE id=:id
+                    """, {"v": vend, "p": po, "n": notes, "id": tid})
+                    st.success("Updated!"); st.session_state.active_popup = None; st.rerun()
+        order_popup(target_tid)
 
 elif st.session_state.page == "New Project":
     st.title("Create Project")
@@ -635,4 +681,3 @@ elif st.session_state.page == "Settings":
         cn = st.text_input("Company", value=user_data['company_name'] if user_data['company_name'] else "")
         if st.form_submit_button("Save"):
             execute_statement("UPDATE users SET company_name=:n WHERE id=:u", {"n": cn, "u": st.session_state.user_id}); st.success("Saved!")
-        
