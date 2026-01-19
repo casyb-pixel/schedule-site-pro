@@ -37,12 +37,6 @@ st.markdown("""
     .metric-value { font-size: 2rem; font-weight: bold; color: #2B588D; }
     .metric-label { font-size: 0.9rem; color: #666; text-transform: uppercase; }
     
-    /* CRITICAL ALERT */
-    .alert-box {
-        background-color: #f8d7da; color: #721c24; padding: 15px;
-        border-radius: 8px; border: 1px solid #f5c6cb; margin-bottom: 15px;
-    }
-    
     /* SUGGESTION BOX */
     .suggestion-box {
         background-color: #d4edda; color: #155724; padding: 15px;
@@ -50,6 +44,7 @@ st.markdown("""
     }
     
     .stButton button { background-color: #2B588D !important; color: white !important; }
+    div[data-testid="stExpander"] details summary p { font-weight: bold; font-size: 1.1em; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -87,16 +82,14 @@ def execute_statement(query, params=None):
 def init_db():
     with engine.begin() as conn:
         conn.execute(text("CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username TEXT UNIQUE, password TEXT, email TEXT, created_at TEXT, company_name TEXT, scheduler_status TEXT DEFAULT 'Trial')"))
-        conn.execute(text("CREATE TABLE IF NOT EXISTS projects (id SERIAL PRIMARY KEY, user_id INTEGER, name TEXT, client_name TEXT, start_date TEXT, status TEXT DEFAULT 'Planning', project_type TEXT DEFAULT 'Residential')"))
+        conn.execute(text("CREATE TABLE IF NOT EXISTS projects (id SERIAL PRIMARY KEY, user_id INTEGER, name TEXT, client_name TEXT, start_date TEXT, status TEXT DEFAULT 'Planning', project_type TEXT DEFAULT 'Residential', non_working_days TEXT DEFAULT '[]')"))
         conn.execute(text("CREATE TABLE IF NOT EXISTS subcontractors (id SERIAL PRIMARY KEY, user_id INTEGER, company_name TEXT, contact_name TEXT, trade TEXT)"))
         conn.execute(text("CREATE TABLE IF NOT EXISTS delay_events (id SERIAL PRIMARY KEY, project_id INTEGER, reason TEXT, days_lost INTEGER, affected_task_ids TEXT, event_date TEXT, description TEXT)"))
         conn.execute(text("CREATE TABLE IF NOT EXISTS task_library (id SERIAL PRIMARY KEY, contractor_type TEXT, phase TEXT, task_name TEXT)"))
         conn.execute(text("CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, project_id INTEGER, phase TEXT, name TEXT, duration INTEGER, start_date_override TEXT, exposure TEXT DEFAULT 'Outdoor', material_lead_time INTEGER DEFAULT 0, inspection_required INTEGER DEFAULT 0, dependencies TEXT, subcontractor_id INTEGER, baseline_start_date TEXT, baseline_end_date TEXT)"))
         
         # Migrations
-        try: conn.execute(text("ALTER TABLE tasks ADD COLUMN phase TEXT"))
-        except: pass
-        try: conn.execute(text("ALTER TABLE projects ADD COLUMN project_type TEXT DEFAULT 'Residential'"))
+        try: conn.execute(text("ALTER TABLE projects ADD COLUMN non_working_days TEXT DEFAULT '[]'"))
         except: pass
         try: conn.execute(text("ALTER TABLE tasks ADD COLUMN baseline_start_date TEXT"))
         except: pass
@@ -105,17 +98,48 @@ def init_db():
 
 init_db()
 
-# --- 5. LOGIC & CALCULATION ---
-def calculate_schedule_dates(tasks_df, project_start_date_str):
+# --- 5. SCHEDULE LOGIC (BUSINESS DAYS) ---
+def add_business_days(start_date, days_to_add, blocked_dates_set):
+    # Adds 'days_to_add' working days to 'start_date', skipping weekends and blocked_dates
+    current_date = start_date
+    
+    # First, if start_date itself is non-working, move to next working day
+    while current_date.weekday() >= 5 or str(current_date) in blocked_dates_set:
+        current_date += datetime.timedelta(days=1)
+        
+    if days_to_add == 0: return current_date
+
+    days_added = 0
+    while days_added < days_to_add:
+        current_date += datetime.timedelta(days=1)
+        # Check if weekend (5=Sat, 6=Sun) or Blocked
+        if current_date.weekday() < 5 and str(current_date) not in blocked_dates_set:
+            days_added += 1
+            
+    return current_date
+
+def calculate_schedule_dates(tasks_df, project_start_date_str, blocked_dates_json="[]"):
     if tasks_df.empty: return tasks_df
     tasks = tasks_df.to_dict('records')
     task_map = {t['id']: t for t in tasks}
+    
+    try: blocked_dates = set(json.loads(blocked_dates_json))
+    except: blocked_dates = set()
+
     proj_start = datetime.datetime.strptime(project_start_date_str, '%Y-%m-%d').date()
     
-    # 1. Forward Pass (Early Dates)
+    # 1. Forward Pass
     for t in tasks:
-        t['early_start'] = datetime.datetime.strptime(t['start_date_override'], '%Y-%m-%d').date() if t.get('start_date_override') else proj_start
-        t['early_finish'] = t['early_start'] + datetime.timedelta(days=t['duration'])
+        # Determine Start
+        if t.get('start_date_override'):
+            base_start = datetime.datetime.strptime(t['start_date_override'], '%Y-%m-%d').date()
+        else:
+            base_start = proj_start
+            
+        # Adjust base_start to be a valid working day if it isn't
+        t['early_start'] = add_business_days(base_start, 0, blocked_dates)
+        t['early_finish'] = add_business_days(t['early_start'], t['duration'], blocked_dates)
+        
         try: t['dep_list'] = [int(x) for x in json.loads(t['dependencies'])]
         except: t['dep_list'] = []
 
@@ -130,43 +154,59 @@ def calculate_schedule_dates(tasks_df, project_start_date_str):
                 pred_finishes = []
                 for pred_id in t['dep_list']:
                     if pred_id in task_map: pred_finishes.append(task_map[pred_id]['early_finish'])
-                new_start = max(pred_finishes) if pred_finishes else proj_start
+                
+                # Start is max predecessor finish. 
+                # Note: In CPM, if Pred finishes Tuesday, Succ starts Wednesday? 
+                # Usually standard is: Finish Day X -> Start Day X+1? Or Finish Day X (PM) -> Start Day X+1 (AM).
+                # Our logic add_business_days returns the 'End Date'. 
+                # We will assume next task starts the next working day AFTER the max finish.
+                if pred_finishes:
+                    max_pred = max(pred_finishes)
+                    # Next working day
+                    new_start = add_business_days(max_pred, 1, blocked_dates)
+                    # BUT subtract 1 day because our duration logic adds from start? 
+                    # Let's keep it simple: If Start=Monday, Dur=1 -> End=Monday. Next task Start=Tuesday.
+                    # My add_business_days(Mon, 1) -> Tue. 
+                    # If I use End=Tue as Start for next... that works.
+                    new_start = max_pred 
+                    # Actually, if Task A (1 day) starts Mon. End = Mon? 
+                    # add_business_days(Mon, 1) = Tue. So my logic implies End is "Morning of next day" or "End of current day"?
+                    # Let's standardize: End Date is the calendar date the work finishes.
+                    # If Start=Mon, Dur=1 -> End=Mon. 
+                    # My function add_business_days(Mon, 1) returns Tue. This means it returns the START of the next day.
+                    # So, Early Start of Successor = Early Finish of Predecessor.
+                    new_start = max_pred
+                else:
+                    new_start = proj_start
+            
+            # Re-align new_start to valid working day
+            new_start = add_business_days(new_start, 0, blocked_dates)
             
             if new_start > t['early_start']:
                 t['early_start'] = new_start
-                t['early_finish'] = new_start + datetime.timedelta(days=t['duration'])
+                t['early_finish'] = add_business_days(new_start, t['duration'], blocked_dates)
                 changed = True
     
-    # Finalize Dates
+    # Finalize
     max_finish = max(t['early_finish'] for t in tasks) if tasks else proj_start
     
-    # 2. Backward Pass (Late Dates & Slack) - Simple Implementation
-    # We assume 'Late Finish' of critical path is the project finish date
     for t in tasks:
         t['start_date'] = t['early_start'].strftime('%Y-%m-%d')
+        # Display end date. Since my logic returns "Start of next day", I should visually show "End of previous day" for Gantt?
+        # Or just keep it continuous. Altair handles ranges fine.
         t['end_date'] = t['early_finish'].strftime('%Y-%m-%d')
+        t['is_critical'] = (t['early_finish'] == max_finish)
         
-        # Identify Critical Path
-        t['is_critical'] = (t['early_finish'] == max_finish) # Simplified logic
-        
-        # Calculate Variance if Baseline exists
         if t.get('baseline_end_date'):
             try:
                 base_end = datetime.datetime.strptime(t['baseline_end_date'], '%Y-%m-%d').date()
-                t['variance'] = (t['early_finish'] - base_end).days # Positive = Late, Negative = Ahead
+                t['variance'] = (t['early_finish'] - base_end).days
             except: t['variance'] = 0
-        else:
-            t['variance'] = 0
-
-    # Better Critical Path Logic: Iterate backward to find true slack
-    # (Simplified for this version: Any task ending on max_finish is critical)
-    # A robust backward pass would be needed for true "Slack" calculation on non-terminal tasks.
-    # For now, we will treat "Non-Critical" tasks as having resource flexibility.
+        else: t['variance'] = 0
 
     return pd.DataFrame(tasks)
 
 def capture_baseline(project_id, tasks_df):
-    # Saves current dates as baseline
     if tasks_df.empty: return
     for _, row in tasks_df.iterrows():
         execute_statement(
@@ -187,15 +227,15 @@ else:
         return wrapper
 
 @dialog_decorator("Manage Task")
-def edit_task_popup(mode, task_id_to_edit, project_id, user_id):
+def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_date):
     selected_task_id = task_id_to_edit
-    t_data = {'name': "New Task", 'phase': 'Pre-Construction', 'duration': 1, 'start_date_override': None, 'subcontractor_id': 0, 'dependencies': "[]", 'exposure': "Outdoor"}
+    # Default start date override to Project Start Date (Smart Default)
+    t_data = {'name': "New Task", 'phase': 'Pre-Construction', 'duration': 1, 'start_date_override': project_start_date, 'subcontractor_id': 0, 'dependencies': "[]"}
 
     if mode == 'edit' and selected_task_id is None:
         all_tasks = run_query("SELECT id, name, phase FROM tasks WHERE project_id=:pid ORDER BY phase, id", {"pid": project_id})
         if all_tasks.empty:
-            st.warning("No tasks to edit.")
-            return
+            st.warning("No tasks to edit."); return
         t_options = {row['id']: f"{row['phase']} - {row['name']}" for _, row in all_tasks.iterrows()}
         selected_task_id = st.selectbox("Select Task to Edit", options=t_options.keys(), format_func=lambda x: t_options[x])
         st.divider()
@@ -230,9 +270,15 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id):
     with st.form("task_f"):
         new_name = st.text_input("Task Name", value=final_name_val)
         c1, c2 = st.columns(2)
-        dur = c1.number_input("Duration", value=t_data['duration'], min_value=1)
-        d_val = datetime.datetime.strptime(t_data['start_date_override'], '%Y-%m-%d') if t_data['start_date_override'] else None
-        start_ov = c2.date_input("Manual Start", value=d_val)
+        dur = c1.number_input("Duration (Days)", value=t_data['duration'], min_value=1)
+        
+        # Handle Date Input format
+        d_val = None
+        if t_data['start_date_override']:
+            try: d_val = datetime.datetime.strptime(str(t_data['start_date_override']), '%Y-%m-%d').date()
+            except: d_val = None
+            
+        start_ov = c2.date_input("Manual Start (Optional)", value=d_val)
         
         subs = run_query("SELECT id, company_name FROM subcontractors WHERE user_id=:u", {"u": user_id})
         sub_opts = {0: "Unassigned"}
@@ -289,9 +335,9 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id):
                     st.success("Added!"); time.sleep(1); st.rerun()
 
 @dialog_decorator("Log Delay")
-def delay_popup(project_id, project_start_date):
+def delay_popup(project_id, project_start_date, blocked_dates_json):
     tasks_raw = run_query("SELECT * FROM tasks WHERE project_id=:pid", {"pid": project_id})
-    tasks = calculate_schedule_dates(tasks_raw, project_start_date)
+    tasks = calculate_schedule_dates(tasks_raw, project_start_date, blocked_dates_json)
     
     with st.form("d_form"):
         st.info("Select the date first to filter active tasks.")
@@ -303,11 +349,7 @@ def delay_popup(project_id, project_start_date):
             active_mask = (tasks['start_dt'] <= date_input) & (tasks['end_dt'] >= date_input)
             active_tasks = tasks[active_mask]
             
-            if active_tasks.empty:
-                st.warning(f"No tasks active on {date_input}. Showing all.")
-                t_opts = {row['id']: row['name'] for _, row in tasks.iterrows()}
-            else:
-                t_opts = {row['id']: row['name'] for _, row in active_tasks.iterrows()}
+            t_opts = {row['id']: row['name'] for _, row in (active_tasks if not active_tasks.empty else tasks).iterrows()}
         else:
             t_opts = {}
 
@@ -323,17 +365,6 @@ def delay_popup(project_id, project_start_date):
                     execute_statement("UPDATE tasks SET duration = duration + :d WHERE id=:tid", {"d": days, "tid": tid})
                 st.session_state.active_popup = None; st.rerun()
             else: st.error("Select tasks")
-
-    st.caption("Recent Delays")
-    delays = run_query("SELECT * FROM delay_events WHERE project_id=:pid ORDER BY event_date DESC", {"pid": project_id})
-    for _, d in delays.iterrows():
-        if st.button(f"🗑️ Delete: {d['reason']} ({d['days_lost']}d)", key=f"dd_{d['id']}"):
-            try:
-                for tid in json.loads(d['affected_task_ids']):
-                    execute_statement("UPDATE tasks SET duration = duration - :d WHERE id=:tid", {"d": d['days_lost'], "tid": tid})
-            except: pass
-            execute_statement("DELETE FROM delay_events WHERE id=:id", {"id": d['id']})
-            st.rerun()
 
 # --- 7. AUTH & MAIN ---
 if 'user_id' not in st.session_state: st.session_state.user_id = None
@@ -390,20 +421,25 @@ if st.session_state.page == "Dashboard":
         st.info("No projects yet. Click 'New Project' to start.")
         st.stop()
         
-    # Project Selector
     sel_p_name = st.selectbox("Select Project to View", projs['name'])
     curr_proj = projs[projs['name'] == sel_p_name].iloc[0]
     pid = int(curr_proj['id'])
+    p_blocked = curr_proj.get('non_working_days', '[]')
     
+    # LAUNCH PROJECT BUTTON
+    c_launch, c_dummy = st.columns([1, 4])
+    if c_launch.button("🚀 Launch Project (Reset Start)"):
+        st.session_state.active_popup = 'launch_project'
+        st.rerun()
+
     # Calc Stats
     tasks_raw = run_query("SELECT * FROM tasks WHERE project_id=:pid", {"pid": pid})
-    tasks = calculate_schedule_dates(tasks_raw, curr_proj['start_date'])
+    tasks = calculate_schedule_dates(tasks_raw, curr_proj['start_date'], p_blocked)
     delays = run_query("SELECT * FROM delay_events WHERE project_id=:pid", {"pid": pid})
     
     if tasks.empty:
         st.warning("No tasks in this project yet.")
     else:
-        # 1. TOP METRICS
         final_date = pd.to_datetime(tasks['end_date']).max().strftime('%b %d, %Y')
         total_delay_days = delays['days_lost'].sum() if not delays.empty else 0
         tasks_ahead = len(tasks[tasks['variance'] < 0]) if 'variance' in tasks.columns else 0
@@ -413,63 +449,40 @@ if st.session_state.page == "Dashboard":
         c2.markdown(f"""<div class="metric-card"><div class="metric-value">{total_delay_days} Days</div><div class="metric-label">Total Delays Logged</div></div>""", unsafe_allow_html=True)
         c3.markdown(f"""<div class="metric-card"><div class="metric-value" style="color:green">{tasks_ahead}</div><div class="metric-label">Tasks Ahead of Schedule</div></div>""", unsafe_allow_html=True)
 
-        # 2. DELAY BREAKDOWN
         st.subheader("⚠️ Delay Analysis")
         if not delays.empty:
             dc1, dc2 = st.columns([1, 2])
             with dc1:
-                # Donut Chart for Reasons
                 d_chart = alt.Chart(delays).mark_arc(innerRadius=50).encode(
-                    theta=alt.Theta("days_lost", stack=True),
-                    color=alt.Color("reason"),
-                    tooltip=["reason", "days_lost"]
-                )
+                    theta=alt.Theta("days_lost", stack=True), color=alt.Color("reason"), tooltip=["reason", "days_lost"])
                 st.altair_chart(d_chart, use_container_width=True)
             with dc2:
                 st.dataframe(delays[['event_date', 'reason', 'days_lost', 'description']], use_container_width=True, hide_index=True)
-        else:
-            st.success("No delays recorded for this project!")
+        else: st.success("No delays recorded for this project!")
 
-        # 3. TASKS AHEAD OF SCHEDULE (BASELINE COMPARISON)
-        st.subheader("🚀 Performance Highlights")
-        if 'variance' in tasks.columns:
-            ahead_df = tasks[tasks['variance'] < 0]
-            if not ahead_df.empty:
-                st.dataframe(ahead_df[['phase', 'name', 'end_date', 'variance']], use_container_width=True)
-            else:
-                st.info("No tasks are currently ahead of baseline.")
-
-        # 4. INTELLIGENT SUGGESTIONS
         st.subheader("💡 Smart Suggestions")
-        
-        # Identify Critical vs Non-Critical
         critical_tasks = tasks[tasks['is_critical'] == True]
         slack_tasks = tasks[tasks['is_critical'] == False]
-        
         if not critical_tasks.empty and not slack_tasks.empty:
-            suggestion_found = False
-            
-            # Simple Logic: Find overlap
-            # If a Slack Task is running at the same time as a Critical Task, suggest moving resources
             crit_start_min = pd.to_datetime(critical_tasks['start_date']).min()
             crit_end_max = pd.to_datetime(critical_tasks['end_date']).max()
-            
-            resources_available = slack_tasks[
-                (pd.to_datetime(slack_tasks['start_date']) >= crit_start_min) & 
-                (pd.to_datetime(slack_tasks['end_date']) <= crit_end_max)
-            ]
-            
+            resources_available = slack_tasks[(pd.to_datetime(slack_tasks['start_date']) >= crit_start_min) & (pd.to_datetime(slack_tasks['end_date']) <= crit_end_max)]
             if not resources_available.empty:
-                st.markdown('<div class="suggestion-box"><strong>Resource Reallocation Opportunity:</strong><br>The following tasks have "slack" (float) and are not critical. Consider moving crew members from these tasks to Critical Path tasks to speed up the schedule:</div>', unsafe_allow_html=True)
-                for _, row in resources_available.iterrows():
-                    st.write(f"- Move resources from **{row['name']}** ({row['phase']})")
-                suggestion_found = True
-            
-            if not suggestion_found:
-                st.info("No obvious resource reallocations found at this time.")
-        else:
-            st.info("Add more tasks to generate suggestions.")
+                st.markdown('<div class="suggestion-box"><strong>Resource Reallocation Opportunity:</strong><br>Consider moving crew from these slack tasks to the Critical Path:</div>', unsafe_allow_html=True)
+                for _, row in resources_available.iterrows(): st.write(f"- Move from **{row['name']}**")
+            else: st.info("No obvious reallocations found.")
+        else: st.info("Add more tasks for suggestions.")
 
+    # POPUP: Launch
+    if st.session_state.active_popup == 'launch_project':
+        @dialog_decorator("🚀 Launch Project")
+        def launch_popup():
+            st.write("This will reset the Project Start Date and recalculate the entire schedule.")
+            new_start = st.date_input("Actual Start Date", value=datetime.date.today())
+            if st.button("Confirm Launch", type="primary"):
+                execute_statement("UPDATE projects SET start_date=:s, status='In Progress' WHERE id=:id", {"s": str(new_start), "id": pid})
+                st.success("Project Launched!"); time.sleep(1); st.session_state.active_popup = None; st.rerun()
+        launch_popup()
 
 elif st.session_state.page == "New Project":
     st.title("Create Project")
@@ -478,59 +491,77 @@ elif st.session_state.page == "New Project":
         pt = st.selectbox("Project Type", ["Residential", "Commercial"])
         if st.form_submit_button("Create", type="primary"):
             try:
-                execute_statement("INSERT INTO projects (user_id, name, client_name, start_date, project_type) VALUES (:u, :n, :c, :s, :pt)", 
+                execute_statement("INSERT INTO projects (user_id, name, client_name, start_date, project_type, non_working_days) VALUES (:u, :n, :c, :s, :pt, '[]')", 
                     {"u": st.session_state.user_id, "n": n, "c": c, "s": str(s), "pt": pt})
                 st.session_state.page = "Scheduler"; st.rerun()
-            except Exception as e:
-                st.error(f"Error creating project: {e}.")
+            except Exception as e: st.error(f"Error: {e}")
 
 elif st.session_state.page == "Scheduler":
     st.title("Scheduler")
-    projs = run_query("SELECT id, name, client_name, start_date, project_type FROM projects WHERE user_id=:u", {"u": st.session_state.user_id})
+    projs = run_query("SELECT id, name, client_name, start_date, project_type, non_working_days FROM projects WHERE user_id=:u", {"u": st.session_state.user_id})
     if projs.empty: st.warning("Create a project first."); st.stop()
     
     c1, c2 = st.columns([3, 1])
     sel_p_name = c1.selectbox("Project", projs['name'])
-    
     curr_proj = projs[projs['name'] == sel_p_name].iloc[0]
     pid = int(curr_proj['id'])
     
+    # --- BLOCKED DATES & SETTINGS ---
+    p_blocked_json = curr_proj.get('non_working_days', '[]')
+    try: p_blocked_list = json.loads(p_blocked_json)
+    except: p_blocked_list = []
+    
     with st.expander(f"⚙️ Project Settings: {sel_p_name}"):
-        with st.form("edit_p"):
-            en = st.text_input("Project Name", value=curr_proj['name'])
-            ec = st.text_input("Client", value=curr_proj['client_name'])
-            es = st.date_input("Start Date", value=datetime.datetime.strptime(curr_proj['start_date'], '%Y-%m-%d'))
-            est = st.selectbox("Status", ["Planning", "In Progress", "Completed", "On Hold"])
-            if st.form_submit_button("Update Project Details"):
-                execute_statement("UPDATE projects SET name=:n, client_name=:c, start_date=:s, status=:st WHERE id=:id",
-                    {"n": en, "c": ec, "s": str(es), "st": est, "id": pid})
-                st.success("Project Updated!"); time.sleep(0.5); st.rerun()
+        tab_gen, tab_hol = st.tabs(["General", "Non-Working Days"])
+        with tab_gen:
+            with st.form("edit_p"):
+                en = st.text_input("Project Name", value=curr_proj['name'])
+                ec = st.text_input("Client", value=curr_proj['client_name'])
+                es = st.date_input("Start Date", value=datetime.datetime.strptime(curr_proj['start_date'], '%Y-%m-%d'))
+                est = st.selectbox("Status", ["Planning", "In Progress", "Completed", "On Hold"])
+                if st.form_submit_button("Update Project Details"):
+                    execute_statement("UPDATE projects SET name=:n, client_name=:c, start_date=:s, status=:st WHERE id=:id", {"n": en, "c": ec, "s": str(es), "st": est, "id": pid})
+                    st.success("Project Updated!"); st.rerun()
+            st.divider()
+            c_del, c_base = st.columns(2)
+            if c_del.button("🗑️ Delete Project", type="secondary"):
+                execute_statement("DELETE FROM tasks WHERE project_id=:pid", {"pid": pid})
+                execute_statement("DELETE FROM delay_events WHERE project_id=:pid", {"pid": pid})
+                execute_statement("DELETE FROM projects WHERE id=:pid", {"pid": pid})
+                st.success("Deleted."); time.sleep(1); st.rerun()
+            if c_base.button("📸 Capture Baseline"):
+                t_curr = calculate_schedule_dates(run_query("SELECT * FROM tasks WHERE project_id=:pid", {"pid": pid}), curr_proj['start_date'], p_blocked_json)
+                capture_baseline(pid, t_curr)
+                st.success("Baseline Captured!")
 
-        st.markdown("---")
-        c_del, c_base = st.columns(2)
-        if c_del.button("🗑️ Delete Entire Project", type="secondary", key="del_proj_btn"):
-            execute_statement("DELETE FROM tasks WHERE project_id=:pid", {"pid": pid})
-            execute_statement("DELETE FROM delay_events WHERE project_id=:pid", {"pid": pid})
-            execute_statement("DELETE FROM projects WHERE id=:pid", {"pid": pid})
-            st.success("Project deleted successfully."); time.sleep(1); st.rerun()
+        with tab_hol:
+            st.write("Add days where NO WORK will happen (Holidays, Events). The schedule will automatically skip these.")
+            c_h1, c_h2 = st.columns([2,1])
+            new_hol = c_h1.date_input("Select Date", key="new_hol_date")
+            if c_h2.button("Add Non-Working Day"):
+                if str(new_hol) not in p_blocked_list:
+                    p_blocked_list.append(str(new_hol))
+                    execute_statement("UPDATE projects SET non_working_days=:nw WHERE id=:id", {"nw": json.dumps(p_blocked_list), "id": pid})
+                    st.success("Added!"); time.sleep(0.5); st.rerun()
             
-        if c_base.button("📸 Capture Baseline"):
-            # Snapshot current schedule as baseline
-            t_curr = calculate_schedule_dates(run_query("SELECT * FROM tasks WHERE project_id=:pid", {"pid": pid}), curr_proj['start_date'])
-            capture_baseline(pid, t_curr)
-            st.success("Baseline Captured! Future variances will now be tracked.")
+            if p_blocked_list:
+                st.write("**Blocked Dates:**")
+                for bd in p_blocked_list:
+                    cb1, cb2 = st.columns([3,1])
+                    cb1.write(bd)
+                    if cb2.button("Remove", key=f"rem_{bd}"):
+                        p_blocked_list.remove(bd)
+                        execute_statement("UPDATE projects SET non_working_days=:nw WHERE id=:id", {"nw": json.dumps(p_blocked_list), "id": pid})
+                        st.rerun()
 
     with c2:
         col_new, col_edit = st.columns(2)
-        if col_new.button("➕ Add Task"): 
-            st.session_state.active_popup = 'add_task'; st.session_state.editing_id = None; st.rerun()
-        if col_edit.button("🖊️ Edit Task"):
-            st.session_state.active_popup = 'edit_task'; st.session_state.editing_id = None; st.rerun()
-        if st.button("⚠️ Log Delay"): 
-            st.session_state.active_popup = 'delay'; st.rerun()
+        if col_new.button("➕ Add Task"): st.session_state.active_popup = 'add_task'; st.session_state.editing_id = None; st.rerun()
+        if col_edit.button("🖊️ Edit Task"): st.session_state.active_popup = 'edit_task'; st.session_state.editing_id = None; st.rerun()
+        if st.button("⚠️ Log Delay"): st.session_state.active_popup = 'delay'; st.rerun()
 
     tasks = run_query("SELECT * FROM tasks WHERE project_id=:pid", {"pid": pid})
-    tasks = calculate_schedule_dates(tasks, curr_proj['start_date'])
+    tasks = calculate_schedule_dates(tasks, curr_proj['start_date'], p_blocked_json)
     
     if not tasks.empty:
         final_date = pd.to_datetime(tasks['end_date']).max().strftime('%B %d, %Y')
@@ -566,9 +597,9 @@ elif st.session_state.page == "Scheduler":
             if row['duration'] != orig['duration']:
                 execute_statement("UPDATE tasks SET duration=:d WHERE id=:id", {"d": row['duration'], "id": row['id']}); st.rerun()
 
-    if st.session_state.active_popup == 'add_task': edit_task_popup('new', None, pid, st.session_state.user_id)
-    if st.session_state.active_popup == 'edit_task': edit_task_popup('edit', None, pid, st.session_state.user_id)
-    if st.session_state.active_popup == 'delay': delay_popup(pid, curr_proj['start_date'])
+    if st.session_state.active_popup == 'add_task': edit_task_popup('new', None, pid, st.session_state.user_id, curr_proj['start_date'])
+    if st.session_state.active_popup == 'edit_task': edit_task_popup('edit', None, pid, st.session_state.user_id, curr_proj['start_date'])
+    if st.session_state.active_popup == 'delay': delay_popup(pid, curr_proj['start_date'], p_blocked_json)
 
 elif st.session_state.page == "Settings":
     st.title("Settings")
