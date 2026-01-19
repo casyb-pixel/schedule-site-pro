@@ -282,7 +282,6 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_da
         c3, c4 = st.columns(2)
         exp_idx = 0 if t_data.get('exposure') == 'Outdoor' else 1
         exposure = c3.selectbox("Exposure", ["Outdoor", "Indoor"], index=exp_idx)
-        # --- FIX: Updated Label ---
         lead_time = c4.number_input("Material Delivery Lead Time (Days)", value=t_data.get('material_lead_time', 0))
         
         c5, c6 = st.columns(2)
@@ -324,52 +323,85 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_da
 
 @dialog_decorator("Log Delay")
 def delay_popup(project_id, project_start_date, blocked_dates_json):
-    # --- FIX 2: RE-CALCULATE DATES INSIDE POPUP ---
-    tasks_raw = run_query("SELECT * FROM tasks WHERE project_id=:pid", {"pid": project_id})
-    tasks = calculate_schedule_dates(tasks_raw, project_start_date, blocked_dates_json)
-    
-    with st.form("d_form"):
-        date_input = st.date_input("Date", value=datetime.date.today())
+    # --- FIX: TWO-STEP WIZARD ---
+    if 'delay_step' not in st.session_state: st.session_state.delay_step = 1
+    if 'delay_temp' not in st.session_state: st.session_state.delay_temp = {}
+
+    # STEP 1: GATHER INFO
+    if st.session_state.delay_step == 1:
+        st.write("### Step 1: Delay Details")
+        with st.form("d_step1"):
+            d_date = st.date_input("Date of Delay", value=datetime.date.today())
+            d_reason = st.selectbox("Reason", ["Weather", "Material", "Inspection", "Other"])
+            d_days = st.number_input("Days Lost", min_value=1, value=1)
+            d_notes = st.text_area("Notes")
+            
+            if st.form_submit_button("Next: Find Affected Tasks"):
+                st.session_state.delay_temp = {
+                    'date': d_date, 'reason': d_reason, 'days': d_days, 'notes': d_notes
+                }
+                st.session_state.delay_step = 2
+                st.rerun()
+
+    # STEP 2: SELECT TASKS (Based on Date from Step 1)
+    if st.session_state.delay_step == 2:
+        st.write("### Step 2: Select Affected Tasks")
+        dt_val = st.session_state.delay_temp['date']
+        st.write(f"Showing tasks active on: **{dt_val}**")
+
+        # Query and Calculate
+        tasks_raw = run_query("SELECT * FROM tasks WHERE project_id=:pid", {"pid": project_id})
+        tasks = calculate_schedule_dates(tasks_raw, project_start_date, blocked_dates_json)
         
-        # Logic: Filter tasks that overlap with the selected date
         t_opts = {}
         if not tasks.empty:
             tasks['start_dt'] = pd.to_datetime(tasks['start_date']).dt.date
             tasks['end_dt'] = pd.to_datetime(tasks['end_date']).dt.date
-            # Simple overlap check: Task Start <= Selected <= Task End
-            active = tasks[(tasks['start_dt'] <= date_input) & (tasks['end_dt'] >= date_input)]
-            # If no tasks match the specific date, fall back to showing all tasks so user can manually pick
+            active = tasks[(tasks['start_dt'] <= dt_val) & (tasks['end_dt'] >= dt_val)]
             source = active if not active.empty else tasks
             t_opts = {row['id']: row['name'] for _, row in source.iterrows()}
-
-        reason = st.selectbox("Reason", ["Weather", "Material", "Inspection", "Other"])
-        days = st.number_input("Days Lost", min_value=1)
-        # --- NEW: DESCRIPTION FIELD ---
-        notes = st.text_area("Notes")
-        aff = st.multiselect("Affected Tasks", options=t_opts.keys(), format_func=lambda x: t_opts[x])
         
-        mitigation = False
-        override = False
-        if reason == "Weather" and aff:
-            aff_subs = tasks[tasks['id'].isin(aff)]['subcontractor_id'].unique()
-            aff_subs = [s for s in aff_subs if s != 0]
-            indoor = tasks[(tasks['subcontractor_id'].isin(aff_subs)) & (tasks['exposure'] == 'Indoor') & (~tasks['id'].isin(aff))]
-            if not indoor.empty:
-                mitigation = True
-                st.markdown("<div class='alert-red'>🛑 INDOOR TASK AVAILABLE: Reassign Sub?</div>", unsafe_allow_html=True)
-                for _, r in indoor.iterrows(): st.write(f"- {r['name']}")
-                override = st.checkbox("Force Delay")
+        with st.form("d_step2"):
+            aff = st.multiselect("Select Tasks to Push", options=t_opts.keys(), format_func=lambda x: t_opts[x])
+            
+            # Mitigation Check
+            mitigation = False
+            override = False
+            if st.session_state.delay_temp['reason'] == "Weather" and aff:
+                aff_subs = tasks[tasks['id'].isin(aff)]['subcontractor_id'].unique()
+                aff_subs = [s for s in aff_subs if s != 0]
+                indoor = tasks[(tasks['subcontractor_id'].isin(aff_subs)) & (tasks['exposure'] == 'Indoor') & (~tasks['id'].isin(aff))]
+                if not indoor.empty:
+                    mitigation = True
+                    st.markdown("<div class='alert-red'>🛑 INDOOR TASK AVAILABLE: Reassign Sub?</div>", unsafe_allow_html=True)
+                    for _, r in indoor.iterrows(): st.write(f"- {r['name']}")
+                    override = st.checkbox("Force Delay (Ignore Mitigation)")
 
-        if st.form_submit_button("Save"):
-            if not aff: st.error("Select tasks.")
-            elif mitigation and not override: st.error("Review mitigation.")
-            else:
-                # --- UPDATE: INSERT WITH DESCRIPTION ---
-                execute_statement("INSERT INTO delay_events (project_id, reason, days_lost, affected_task_ids, event_date, description) VALUES (:pid, :r, :d, :a, :date, :desc)",
-                    {"pid": project_id, "r": reason, "d": days, "a": json.dumps(aff), "date": str(date_input), "desc": notes})
-                for tid in aff:
-                    execute_statement("UPDATE tasks SET duration = duration + :d WHERE id=:tid", {"d": days, "tid": tid})
-                st.session_state.active_popup = None; st.rerun()
+            c_back, c_sub = st.columns([1, 1])
+            # Note: Buttons inside forms act as submits. We use logic to distinguish.
+            # Actually, standard Streamlit forms don't support multiple buttons nicely. 
+            # We will just have Confirm here and a 'Cancel' outside.
+            
+            if st.form_submit_button("✅ Confirm Delay"):
+                if not aff: st.error("Please select at least one task.")
+                elif mitigation and not override: st.error("Please review mitigation options above.")
+                else:
+                    # Save
+                    meta = st.session_state.delay_temp
+                    execute_statement("INSERT INTO delay_events (project_id, reason, days_lost, affected_task_ids, event_date, description) VALUES (:pid, :r, :d, :a, :date, :desc)",
+                        {"pid": project_id, "r": meta['reason'], "d": meta['days'], "a": json.dumps(aff), "date": str(meta['date']), "desc": meta['notes']})
+                    for tid in aff:
+                        execute_statement("UPDATE tasks SET duration = duration + :d WHERE id=:tid", {"d": meta['days'], "tid": tid})
+                    
+                    # Reset State
+                    del st.session_state.delay_step
+                    del st.session_state.delay_temp
+                    st.session_state.active_popup = None
+                    st.rerun()
+
+        if st.button("⬅️ Back"):
+            st.session_state.delay_step = 1
+            st.rerun()
 
 # --- 7. AUTH & MAIN ---
 if 'user_id' not in st.session_state: st.session_state.user_id = None
@@ -475,7 +507,7 @@ if st.session_state.page == "Dashboard":
             
             st.divider()
 
-            # --- UPDATED MATERIAL ALERTS LOGIC (Robust NULL Handling) ---
+            # --- MATERIAL ALERTS LOGIC (Robust) ---
             st.subheader("⚠️ Action Required")
             today = datetime.date.today()
             
@@ -582,7 +614,13 @@ elif st.session_state.page == "Scheduler":
     tasks = calculate_schedule_dates(tasks, curr_proj['start_date'], p_blocked)
     
     if not tasks.empty:
-        tasks['Color'] = tasks.apply(lambda x: '#DAA520' if x.get('is_critical') else '#2B588D', axis=1)
+        # --- FIX 2: GREEN COLOR FOR 100% COMPLETE ---
+        def get_color(row):
+            if row.get('percent_complete', 0) == 100: return '#28a745' # Green
+            if row.get('is_critical'): return '#DAA520' # Gold
+            return '#2B588D' # Blue
+            
+        tasks['Color'] = tasks.apply(get_color, axis=1)
         
         # Chart
         PHASE_ORDER = ["Pre-Construction", "Site Work", "Foundation", "Framing", "Exterior Building", "Interior Building", "Paving & Parking", "Final Systems and Testing", "Punchlist & Closeout"]
@@ -606,7 +644,7 @@ elif st.session_state.page == "Scheduler":
         ).properties(height=chart_height).interactive()
         
         st.altair_chart(base, use_container_width=True)
-        st.caption("Gold = Critical Path. Blue = Standard Task.")
+        st.caption("Green = Complete. Gold = Critical Path. Blue = Standard Task.")
 
         # --- FIX 2: ENABLE EDITING BY USING NUMBER COLUMN ---
         editor_df = tasks[['id', 'phase', 'name', 'start_date', 'end_date', 'percent_complete']].copy()
