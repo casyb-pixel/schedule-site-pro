@@ -28,7 +28,6 @@ st.markdown("""
     [data-testid="stSidebar"] { background-color: #2B588D; }
     [data-testid="stSidebar"] * { color: white !important; }
     
-    /* DASHBOARD METRICS */
     .metric-card {
         background-color: white; padding: 20px; border-radius: 12px;
         box-shadow: 0 4px 6px rgba(0,0,0,0.05); text-align: center;
@@ -38,13 +37,14 @@ st.markdown("""
     .metric-value { font-size: 2.2rem; font-weight: 800; color: #2B588D; }
     .metric-label { font-size: 0.95rem; color: #555; text-transform: uppercase; letter-spacing: 1px; margin-top: 5px; }
     
-    /* ALERTS */
     .alert-red { background-color: #ffebee; color: #c62828; padding: 12px; border-radius: 8px; border-left: 5px solid #c62828; margin-bottom: 8px; font-weight: 500; font-size: 0.9rem; }
     .alert-yellow { background-color: #fff8e1; color: #f57f17; padding: 12px; border-radius: 8px; border-left: 5px solid #f57f17; margin-bottom: 8px; font-weight: 500; font-size: 0.9rem; }
     
     .suggestion-box { background-color: #e8f5e9; color: #2e7d32; padding: 15px; border-radius: 8px; border: 1px solid #c8e6c9; margin-bottom: 10px; }
-    
     .stButton button { background-color: #2B588D !important; color: white !important; font-weight: bold; border-radius: 6px; }
+    
+    /* Chart text fix */
+    text { font-family: sans-serif !important; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -88,13 +88,16 @@ def init_db():
         conn.execute(text("CREATE TABLE IF NOT EXISTS task_library (id SERIAL PRIMARY KEY, contractor_type TEXT, phase TEXT, task_name TEXT)"))
         conn.execute(text("CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, project_id INTEGER, phase TEXT, name TEXT, duration INTEGER, start_date_override TEXT, exposure TEXT DEFAULT 'Outdoor', material_lead_time INTEGER DEFAULT 0, material_status TEXT DEFAULT 'Not Ordered', inspection_required INTEGER DEFAULT 0, percent_complete INTEGER DEFAULT 0, dependencies TEXT, subcontractor_id INTEGER, baseline_start_date TEXT, baseline_end_date TEXT)"))
         
-        # Migrations (Auto-Healing)
-        try: conn.execute(text("ALTER TABLE tasks ADD COLUMN material_status TEXT DEFAULT 'Not Ordered'"))
-        except: pass
-        try: conn.execute(text("ALTER TABLE subcontractors ADD COLUMN phone TEXT"))
-        except: pass
-        try: conn.execute(text("ALTER TABLE subcontractors ADD COLUMN email TEXT"))
-        except: pass
+        # Migrations
+        for col in ['material_status', 'exposure', 'baseline_start_date', 'baseline_end_date']:
+            try: conn.execute(text(f"ALTER TABLE tasks ADD COLUMN {col} TEXT"))
+            except: pass
+        for col in ['material_lead_time', 'inspection_required', 'percent_complete']:
+            try: conn.execute(text(f"ALTER TABLE tasks ADD COLUMN {col} INTEGER DEFAULT 0"))
+            except: pass
+        for col in ['phone', 'email']:
+            try: conn.execute(text(f"ALTER TABLE subcontractors ADD COLUMN {col} TEXT"))
+            except: pass
 
 init_db()
 
@@ -118,14 +121,10 @@ def calculate_schedule_dates(tasks_df, project_start_date_str, blocked_dates_jso
     try: blocked_dates = set(json.loads(blocked_dates_json or "[]"))
     except: blocked_dates = set()
     
-    # Robust Date Parsing
-    try:
-        proj_start = pd.to_datetime(project_start_date_str).date()
-    except:
-        proj_start = datetime.date.today()
+    try: proj_start = pd.to_datetime(project_start_date_str).date()
+    except: proj_start = datetime.date.today()
     
     for t in tasks:
-        # Check Override
         base_start = proj_start
         if t.get('start_date_override'):
             try: base_start = pd.to_datetime(t['start_date_override']).date()
@@ -161,14 +160,11 @@ def calculate_schedule_dates(tasks_df, project_start_date_str, blocked_dates_jso
         t['start_date'] = t['early_start'].strftime('%Y-%m-%d')
         t['end_date'] = t['early_finish'].strftime('%Y-%m-%d')
         t['is_critical'] = (t['early_finish'] == max_finish)
-        
-        # Variance Calculation (Needs valid baseline)
         t['variance'] = 0
         if t.get('baseline_end_date'):
             try:
                 base_end = pd.to_datetime(t['baseline_end_date']).date()
                 curr_end = t['early_finish']
-                # Variance = Actual - Baseline. Positive = Late. Negative = Ahead.
                 t['variance'] = (curr_end - base_end).days
             except: pass
             
@@ -177,7 +173,11 @@ def calculate_schedule_dates(tasks_df, project_start_date_str, blocked_dates_jso
 def capture_baseline(project_id, tasks_df):
     if tasks_df.empty: return
     for _, row in tasks_df.iterrows():
-        execute_statement("UPDATE tasks SET baseline_start_date=:s, baseline_end_date=:e WHERE id=:id", {"s": row['start_date'], "e": row['end_date'], "id": row['id']})
+        # Ensure dates are strings for SQL
+        s_str = str(row['start_date'])
+        e_str = str(row['end_date'])
+        execute_statement("UPDATE tasks SET baseline_start_date=:s, baseline_end_date=:e WHERE id=:id", 
+            {"s": s_str, "e": e_str, "id": row['id']})
 
 # --- 6. POPUPS ---
 if hasattr(st, 'dialog'): dialog_decorator = st.dialog
@@ -198,7 +198,7 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_da
 
     if mode == 'edit' and selected_task_id is None:
         all_tasks = run_query("SELECT id, name, phase FROM tasks WHERE project_id=:pid ORDER BY phase, id", {"pid": project_id})
-        if all_tasks.empty: st.warning("No tasks."); return
+        if all_tasks.empty: st.warning("No tasks to edit."); return
         t_options = {row['id']: f"{row['phase']} - {row['name']}" for _, row in all_tasks.iterrows()}
         selected_task_id = st.selectbox("Select Task to Edit", options=t_options.keys(), format_func=lambda x: t_options[x])
         st.divider()
@@ -214,7 +214,6 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_da
 
     lib_df = run_query("SELECT * FROM task_library WHERE contractor_type IN ('All', :pt)", {"pt": p_type})
     phases = sorted(lib_df['phase'].unique().tolist()) if not lib_df.empty else []
-    
     if not phases: st.error("⚠️ Library empty!")
 
     c_ph, c_tk = st.columns(2)
@@ -421,19 +420,9 @@ if st.session_state.page == "Dashboard":
         tab_dash, tab_wbs = st.tabs(["📊 Dashboard Overview", "📋 WBS View"])
         with tab_dash:
             final_date = pd.to_datetime(tasks['end_date']).max().strftime('%b %d, %Y')
-            
-            # Tasks Ahead: Variance < 0 (requires baseline)
-            tasks_ahead = len(tasks[tasks['variance'] < 0])
-            
-            # Completion % (Average of all tasks)
-            overall_pct = int(tasks['percent_complete'].mean()) if 'percent_complete' in tasks.columns else 0
-            
-            # --- TOP METRICS ROW ---
-            c1, c2, c3 = st.columns(3)
-            c1.markdown(f"<div class='metric-card'><div class='metric-value'>{final_date}</div><div class='metric-label'>Projected Completion</div></div>", unsafe_allow_html=True)
-            c2.markdown(f"<div class='metric-card'><div class='metric-value'>{overall_pct}%</div><div class='metric-label'>Project Progress</div><progress value='{overall_pct}' max='100' style='width:80%; margin:auto'></progress></div>", unsafe_allow_html=True)
-            color = "green" if tasks_ahead > 0 else "#999"
-            c3.markdown(f"<div class='metric-card'><div class='metric-value' style='color:{color}'>{tasks_ahead}</div><div class='metric-label'>Tasks Ahead of Sched.</div></div>", unsafe_allow_html=True)
+            c1, c2 = st.columns(2)
+            c1.markdown(f"<div class='metric-card'><div class='metric-value'>{final_date}</div><div class='metric-label'>Completion</div></div>", unsafe_allow_html=True)
+            c2.markdown(f"<div class='metric-card'><div class='metric-value'>{len(tasks[tasks['variance']<0])}</div><div class='metric-label'>Tasks Ahead</div></div>", unsafe_allow_html=True)
             
             st.subheader("⚠️ Action Required")
             today = datetime.date.today()
@@ -513,63 +502,31 @@ elif st.session_state.page == "Scheduler":
     if not tasks.empty:
         tasks['Color'] = tasks.apply(lambda x: '#DAA520' if x.get('is_critical') else '#2B588D', axis=1)
         
-        # --- PREPARE GANTT DATA (Sorting & Scaling) ---
+        # --- FIXED CHART VISUALS (Independent Scales + Filtering) ---
+        min_start = pd.to_datetime(tasks['start_date']).min()
+        max_end = pd.to_datetime(tasks['end_date']).max()
+        view_min = (min_start - datetime.timedelta(days=5)).strftime('%Y-%m-%d')
+        view_max = (max_end + datetime.timedelta(days=5)).strftime('%Y-%m-%d')
+        
         PHASE_ORDER = ["Pre-Construction", "Site Work", "Foundation", "Framing", "Exterior Building", "Interior Building", "Paving & Parking", "Final Systems and Testing", "Punchlist & Closeout"]
         
-        # 1. Force Sorting in Pandas first
+        # Sort data first for Altair
         phase_map = {p: i for i, p in enumerate(PHASE_ORDER)}
         tasks['phase_order'] = tasks['phase'].map(phase_map).fillna(99)
         tasks = tasks.sort_values(by=['phase_order', 'start_date'])
         
-        # 2. Dynamic Height Calculation
-        chart_height = max(400, len(tasks) * 25) # 25px per task
-        
-        # 3. Dynamic X-Axis Domain
-        min_date = pd.to_datetime(tasks['start_date']).min()
-        max_date = pd.to_datetime(tasks['end_date']).max()
-        buffer = datetime.timedelta(days=7)
-        domain = [(min_date - buffer).strftime('%Y-%m-%d'), (max_date + buffer).strftime('%Y-%m-%d')]
-
-        # 4. The Chart
-        base = alt.Chart(tasks).mark_bar(cornerRadius=3, height=15).encode(
-            x=alt.X('start_date:T', scale=alt.Scale(domain=domain), title='Date'),
+        base = alt.Chart(tasks).mark_bar(cornerRadius=3, height=20).encode(
+            x=alt.X('start_date:T', scale=alt.Scale(domain=[view_min, view_max]), title='Date'),
             x2='end_date:T',
-            y=alt.Y('name:N', sort=None, title=None), # sort=None respects Pandas sort order
-            row=alt.Row('phase:N', sort=PHASE_ORDER, title="Phase"), # Group by Phase
+            y=alt.Y('name:N', title=None), 
             color=alt.Color('Color', scale=None),
-            tooltip=[
-                alt.Tooltip('phase', title='Phase'),
-                alt.Tooltip('name', title='Task'),
-                alt.Tooltip('start_date', title='Start'),
-                alt.Tooltip('end_date', title='End'),
-                alt.Tooltip('duration', title='Days'),
-                alt.Tooltip('percent_complete', title='% Done')
-            ]
-        ).properties(height=chart_height).interactive() # Make it taller
+            tooltip=['phase', 'name', 'start_date', 'end_date']
+        ).facet(
+            row=alt.Row('phase:N', sort=PHASE_ORDER, title=None) # Facet by phase
+        ).resolve_scale(y='independent') # THIS FIXES THE JUMBLED/EMPTY ROWS
         
         st.altair_chart(base, use_container_width=True)
-        st.caption("Tip: Use mouse wheel to zoom in/out on the timeline.")
-        
-        # Grid
         st.data_editor(tasks[['phase', 'name', 'start_date', 'end_date', 'duration']], hide_index=True, disabled=True)
-
-    with st.expander(f"⚙️ Project Settings: {sel_p_name}"):
-        tab_gen, tab_hol = st.tabs(["General", "Non-Working Days"])
-        with tab_gen:
-            with st.form("edit_p"):
-                en = st.text_input("Project Name", value=curr_proj['name'])
-                ec = st.text_input("Client", value=curr_proj['client_name'])
-                es = st.date_input("Start Date", value=datetime.datetime.strptime(curr_proj['start_date'], '%Y-%m-%d'))
-                if st.form_submit_button("Update"):
-                    execute_statement("UPDATE projects SET name=:n, client_name=:c, start_date=:s WHERE id=:id", {"n": en, "c": ec, "s": str(es), "id": pid}); st.rerun()
-            st.divider()
-            if st.button("📸 Capture Baseline"):
-                capture_baseline(pid, tasks)
-                st.success("Baseline Captured! 'Tasks Ahead' metrics are now active.")
-            if st.button("🗑️ Delete Project", type="secondary"):
-                execute_statement("DELETE FROM tasks WHERE project_id=:pid", {"pid": pid})
-                execute_statement("DELETE FROM projects WHERE id=:pid", {"pid": pid})
-                st.rerun()
 
     if st.session_state.active_popup == 'add_task': edit_task_popup('new', None, pid, st.session_state.user_id, curr_proj['start_date'])
     if st.session_state.active_popup == 'edit_task': edit_task_popup('edit', None, pid, st.session_state.user_id, curr_proj['start_date'])
