@@ -37,7 +37,16 @@ st.markdown("""
     .metric-value { font-size: 2rem; font-weight: bold; color: #2B588D; }
     .metric-label { font-size: 0.9rem; color: #666; text-transform: uppercase; }
     
-    /* SUGGESTION BOX */
+    /* ALERTS */
+    .alert-red {
+        background-color: #f8d7da; color: #721c24; padding: 10px; border-radius: 5px; 
+        border: 1px solid #f5c6cb; margin-bottom: 10px; font-weight: bold;
+    }
+    .alert-yellow {
+        background-color: #fff3cd; color: #856404; padding: 10px; border-radius: 5px; 
+        border: 1px solid #ffeeba; margin-bottom: 10px; font-weight: bold;
+    }
+    
     .suggestion-box {
         background-color: #d4edda; color: #155724; padding: 15px;
         border-radius: 8px; border: 1px solid #c3e6cb; margin-bottom: 10px;
@@ -94,6 +103,10 @@ def init_db():
         try: conn.execute(text("ALTER TABLE tasks ADD COLUMN baseline_start_date TEXT"))
         except: pass
         try: conn.execute(text("ALTER TABLE tasks ADD COLUMN baseline_end_date TEXT"))
+        except: pass
+        try: conn.execute(text("ALTER TABLE tasks ADD COLUMN exposure TEXT DEFAULT 'Outdoor'"))
+        except: pass
+        try: conn.execute(text("ALTER TABLE tasks ADD COLUMN material_lead_time INTEGER DEFAULT 0"))
         except: pass
 
 init_db()
@@ -201,7 +214,7 @@ else:
 @dialog_decorator("Manage Task")
 def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_date):
     selected_task_id = task_id_to_edit
-    t_data = {'name': "New Task", 'phase': 'Pre-Construction', 'duration': 1, 'start_date_override': project_start_date, 'subcontractor_id': 0, 'dependencies': "[]"}
+    t_data = {'name': "New Task", 'phase': 'Pre-Construction', 'duration': 1, 'start_date_override': project_start_date, 'subcontractor_id': 0, 'dependencies': "[]", 'exposure': 'Outdoor', 'material_lead_time': 0}
 
     if mode == 'edit' and selected_task_id is None:
         all_tasks = run_query("SELECT id, name, phase FROM tasks WHERE project_id=:pid ORDER BY phase, id", {"pid": project_id})
@@ -240,9 +253,17 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_da
 
     with st.form("task_f"):
         new_name = st.text_input("Task Name", value=final_name_val)
+        
         c1, c2 = st.columns(2)
         dur = c1.number_input("Duration (Days)", value=t_data['duration'], min_value=1)
         
+        # --- NEW FIELDS FOR EXPOSURE AND LEAD TIME ---
+        c3, c4 = st.columns(2)
+        exp_idx = 0 if t_data.get('exposure') == 'Outdoor' else 1
+        exposure = c3.selectbox("Exposure", ["Outdoor", "Indoor"], index=exp_idx)
+        lead_time = c4.number_input("Material Lead Time (Days)", value=t_data.get('material_lead_time', 0), min_value=0)
+        # ---------------------------------------------
+
         d_val = None
         if t_data['start_date_override']:
             try: d_val = datetime.datetime.strptime(str(t_data['start_date_override']), '%Y-%m-%d').date()
@@ -283,11 +304,11 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_da
             ph = sel_phase if sel_phase != "Custom" else "General"
             
             if selected_task_id:
-                execute_statement("UPDATE tasks SET name=:n, phase=:p, duration=:d, start_date_override=:ov, subcontractor_id=:s, dependencies=:dep WHERE id=:id",
-                    {"n": new_name, "p": ph, "d": dur, "ov": ov, "s": sub_id, "dep": dep_j, "id": selected_task_id})
+                execute_statement("UPDATE tasks SET name=:n, phase=:p, duration=:d, start_date_override=:ov, subcontractor_id=:s, dependencies=:dep, exposure=:ex, material_lead_time=:mlt WHERE id=:id",
+                    {"n": new_name, "p": ph, "d": dur, "ov": ov, "s": sub_id, "dep": dep_j, "ex": exposure, "mlt": lead_time, "id": selected_task_id})
             else:
-                execute_statement("INSERT INTO tasks (project_id, name, phase, duration, start_date_override, subcontractor_id, dependencies) VALUES (:pid, :n, :p, :d, :ov, :s, :dep)",
-                    {"pid": project_id, "n": new_name, "p": ph, "d": dur, "ov": ov, "s": sub_id, "dep": dep_j})
+                execute_statement("INSERT INTO tasks (project_id, name, phase, duration, start_date_override, subcontractor_id, dependencies, exposure, material_lead_time) VALUES (:pid, :n, :p, :d, :ov, :s, :dep, :ex, :mlt)",
+                    {"pid": project_id, "n": new_name, "p": ph, "d": dur, "ov": ov, "s": sub_id, "dep": dep_j, "ex": exposure, "mlt": lead_time})
             st.session_state.active_popup = None; st.rerun()
             
         if del_btn:
@@ -313,6 +334,8 @@ def delay_popup(project_id, project_start_date, blocked_dates_json):
         st.info("Select the date first to filter active tasks.")
         date_input = st.date_input("Date of Delay", value=datetime.date.today())
         
+        # 1. Filter Tasks Active on Date
+        active_tasks = pd.DataFrame()
         if not tasks.empty:
             tasks['start_dt'] = pd.to_datetime(tasks['start_date']).dt.date
             tasks['end_dt'] = pd.to_datetime(tasks['end_date']).dt.date
@@ -323,18 +346,59 @@ def delay_popup(project_id, project_start_date, blocked_dates_json):
         else:
             t_opts = {}
 
+        # 2. Delay Form Inputs
         reason = st.selectbox("Reason", ["Weather", "Material", "Inspection", "Other"])
         days = st.number_input("Days Lost", min_value=1)
         aff = st.multiselect("Affected Tasks", options=t_opts.keys(), format_func=lambda x: t_opts[x])
         
-        if st.form_submit_button("Save Delay", type="primary"):
-            if aff:
+        # 3. MITIGATION LOGIC CHECK (WEATHER)
+        mitigation_warning = False
+        override_checkbox = False
+        
+        if reason == "Weather" and aff:
+            # Check selected affected tasks for their subcontractors
+            affected_subs = tasks[tasks['id'].isin(aff)]['subcontractor_id'].unique()
+            affected_subs = [s for s in affected_subs if s != 0] # Filter out unassigned
+            
+            if affected_subs:
+                # Find OTHER 'Indoor' tasks for these subs that are NOT completed (we check all tasks for now)
+                # Ideally, checking tasks that are 'Ready to Start' or 'In Progress' is better, but checking 'Indoor' is the core request.
+                indoor_candidates = tasks[
+                    (tasks['subcontractor_id'].isin(affected_subs)) & 
+                    (tasks['exposure'] == 'Indoor') & 
+                    (~tasks['id'].isin(aff)) # Not the one being delayed
+                ]
+                
+                if not indoor_candidates.empty:
+                    mitigation_warning = True
+                    st.markdown("""
+                        <div class='alert-red'>
+                        🛑 MITIGATION OPPORTUNITY FOUND<br>
+                        We noticed you are logging a WEATHER delay. The following subcontractors have INDOOR tasks available.
+                        Instead of delaying the schedule, consider reassigning them:
+                        </div>
+                    """, unsafe_allow_html=True)
+                    for _, row in indoor_candidates.iterrows():
+                        st.write(f"- **{row['name']}** (Indoor) - Sub ID: {row['subcontractor_id']}")
+                    
+                    st.write("---")
+                    override_checkbox = st.checkbox("I cannot reassign. Proceed with Delay.")
+
+        # 4. SUBMIT BUTTON LOGIC
+        submitted = st.form_submit_button("Save Delay", type="primary")
+        
+        if submitted:
+            if not aff:
+                st.error("Select tasks first.")
+            elif mitigation_warning and not override_checkbox:
+                st.error("Please review the mitigation suggestion above. Check the box to override if you must delay.")
+            else:
+                # Proceed
                 execute_statement("INSERT INTO delay_events (project_id, reason, days_lost, affected_task_ids, event_date) VALUES (:pid, :r, :d, :a, :date)",
                     {"pid": project_id, "r": reason, "d": days, "a": json.dumps(aff), "date": str(date_input)})
                 for tid in aff:
                     execute_statement("UPDATE tasks SET duration = duration + :d WHERE id=:tid", {"d": days, "tid": tid})
                 st.session_state.active_popup = None; st.rerun()
-            else: st.error("Select tasks")
 
 # --- 7. AUTH & MAIN ---
 if 'user_id' not in st.session_state: st.session_state.user_id = None
@@ -422,6 +486,34 @@ if st.session_state.page == "Dashboard":
             c1.markdown(f"""<div class="metric-card"><div class="metric-value">{final_date}</div><div class="metric-label">Projected Completion</div></div>""", unsafe_allow_html=True)
             c2.markdown(f"""<div class="metric-card"><div class="metric-value">{total_delay_days} Days</div><div class="metric-label">Total Delays Logged</div></div>""", unsafe_allow_html=True)
             c3.markdown(f"""<div class="metric-card"><div class="metric-value" style="color:green">{tasks_ahead}</div><div class="metric-label">Tasks Ahead of Schedule</div></div>""", unsafe_allow_html=True)
+            
+            # --- MATERIAL PROCUREMENT ALERTS (NEW) ---
+            st.subheader("📦 Material Procurement Alerts")
+            today = datetime.date.today()
+            alert_found = False
+            for _, t in tasks.iterrows():
+                lead = t.get('material_lead_time', 0)
+                if lead > 0:
+                    start_dt = pd.to_datetime(t['start_date']).date()
+                    days_until_start = (start_dt - today).days
+                    
+                    # Logic: 
+                    # If 14 days lead time:
+                    # Alert triggers at (Start - 21 days) -> Yellow
+                    # Alert turns Red at (Start - 14 days)
+                    
+                    if days_until_start <= lead: 
+                        # We are IN the lead time window or past it
+                        st.markdown(f"<div class='alert-red'>🔴 URGENT: Order Materials for '{t['name']}' (Lead: {lead} days). Task starts in {days_until_start} days!</div>", unsafe_allow_html=True)
+                        alert_found = True
+                    elif days_until_start <= (lead + 7):
+                        # We are in the 7 day warning buffer before lead time starts
+                        st.markdown(f"<div class='alert-yellow'>🟡 WARNING: Order Materials for '{t['name']}' soon. (Lead: {lead} days).</div>", unsafe_allow_html=True)
+                        alert_found = True
+            
+            if not alert_found:
+                st.info("No immediate material orders required.")
+            # ---------------------------------------------
 
             st.subheader("⚠️ Delay Analysis")
             if not delays.empty:
@@ -449,48 +541,22 @@ if st.session_state.page == "Dashboard":
 
         with tab_wbs:
             st.subheader("Work Breakdown Structure (WBS)")
-            # 1. Define Phase Map
             PHASE_ORDER = {
-                "Pre-Construction": 1, 
-                "Site Work": 2, 
-                "Foundation": 3, 
-                "Framing": 4,
-                "Exterior Building": 5, 
-                "Interior Building": 6, 
-                "Paving & Parking": 7,
-                "Final Systems and Testing": 8, 
-                "Punchlist & Closeout": 9
+                "Pre-Construction": 1, "Site Work": 2, "Foundation": 3, "Framing": 4,
+                "Exterior Building": 5, "Interior Building": 6, "Paving & Parking": 7,
+                "Final Systems and Testing": 8, "Punchlist & Closeout": 9
             }
-            
-            # 2. Sort & Assign
-            # Assign '99' to phases not in the map so they drop to bottom
             tasks['wbs_major'] = tasks['phase'].map(PHASE_ORDER).fillna(99).astype(int)
-            
-            # Sort by Major Phase, then Start Date
             tasks = tasks.sort_values(by=['wbs_major', 'start_date'])
-            
-            # Generate WBS X.XX
             wbs_list = []
-            phase_counters = {} # {1: 0, 2: 0...}
-            
+            phase_counters = {}
             for _, row in tasks.iterrows():
                 major = row['wbs_major']
                 if major not in phase_counters: phase_counters[major] = 0
                 phase_counters[major] += 1
-                
-                # Format: 1.01, 1.02...
-                sub = phase_counters[major]
-                wbs_str = f"{major}.{sub:02d}"
-                wbs_list.append(wbs_str)
-            
+                wbs_list.append(f"{major}.{phase_counters[major]:02d}")
             tasks['WBS ID'] = wbs_list
-            
-            # Display Table
-            st.dataframe(
-                tasks[['WBS ID', 'phase', 'name', 'duration', 'start_date', 'end_date']],
-                use_container_width=True,
-                hide_index=True
-            )
+            st.dataframe(tasks[['WBS ID', 'phase', 'name', 'duration', 'start_date', 'end_date', 'material_lead_time', 'exposure']], use_container_width=True, hide_index=True)
 
     # POPUP: Launch
     if st.session_state.active_popup == 'launch_project':
@@ -592,7 +658,8 @@ elif st.session_state.page == "Scheduler":
                 alt.Tooltip('name', title='Task'),
                 alt.Tooltip('start_date', format='%b %d, %Y', title='Start'),
                 alt.Tooltip('end_date', format='%b %d, %Y', title='End'),
-                alt.Tooltip('duration', title='Days')
+                alt.Tooltip('duration', title='Days'),
+                alt.Tooltip('exposure', title='Exposure')
             ]
         ).interactive()
         
