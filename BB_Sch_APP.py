@@ -100,10 +100,7 @@ init_db()
 
 # --- 5. SCHEDULE LOGIC (BUSINESS DAYS) ---
 def add_business_days(start_date, days_to_add, blocked_dates_set):
-    # Adds 'days_to_add' working days to 'start_date', skipping weekends and blocked_dates
     current_date = start_date
-    
-    # First, if start_date itself is non-working, move to next working day
     while current_date.weekday() >= 5 or str(current_date) in blocked_dates_set:
         current_date += datetime.timedelta(days=1)
         
@@ -112,7 +109,6 @@ def add_business_days(start_date, days_to_add, blocked_dates_set):
     days_added = 0
     while days_added < days_to_add:
         current_date += datetime.timedelta(days=1)
-        # Check if weekend (5=Sat, 6=Sun) or Blocked
         if current_date.weekday() < 5 and str(current_date) not in blocked_dates_set:
             days_added += 1
             
@@ -128,15 +124,13 @@ def calculate_schedule_dates(tasks_df, project_start_date_str, blocked_dates_jso
 
     proj_start = datetime.datetime.strptime(project_start_date_str, '%Y-%m-%d').date()
     
-    # 1. Forward Pass
+    # Forward Pass
     for t in tasks:
-        # Determine Start
         if t.get('start_date_override'):
             base_start = datetime.datetime.strptime(t['start_date_override'], '%Y-%m-%d').date()
         else:
             base_start = proj_start
             
-        # Adjust base_start to be a valid working day if it isn't
         t['early_start'] = add_business_days(base_start, 0, blocked_dates)
         t['early_finish'] = add_business_days(t['early_start'], t['duration'], blocked_dates)
         
@@ -155,31 +149,12 @@ def calculate_schedule_dates(tasks_df, project_start_date_str, blocked_dates_jso
                 for pred_id in t['dep_list']:
                     if pred_id in task_map: pred_finishes.append(task_map[pred_id]['early_finish'])
                 
-                # Start is max predecessor finish. 
-                # Note: In CPM, if Pred finishes Tuesday, Succ starts Wednesday? 
-                # Usually standard is: Finish Day X -> Start Day X+1? Or Finish Day X (PM) -> Start Day X+1 (AM).
-                # Our logic add_business_days returns the 'End Date'. 
-                # We will assume next task starts the next working day AFTER the max finish.
                 if pred_finishes:
                     max_pred = max(pred_finishes)
-                    # Next working day
-                    new_start = add_business_days(max_pred, 1, blocked_dates)
-                    # BUT subtract 1 day because our duration logic adds from start? 
-                    # Let's keep it simple: If Start=Monday, Dur=1 -> End=Monday. Next task Start=Tuesday.
-                    # My add_business_days(Mon, 1) -> Tue. 
-                    # If I use End=Tue as Start for next... that works.
-                    new_start = max_pred 
-                    # Actually, if Task A (1 day) starts Mon. End = Mon? 
-                    # add_business_days(Mon, 1) = Tue. So my logic implies End is "Morning of next day" or "End of current day"?
-                    # Let's standardize: End Date is the calendar date the work finishes.
-                    # If Start=Mon, Dur=1 -> End=Mon. 
-                    # My function add_business_days(Mon, 1) returns Tue. This means it returns the START of the next day.
-                    # So, Early Start of Successor = Early Finish of Predecessor.
                     new_start = max_pred
                 else:
                     new_start = proj_start
             
-            # Re-align new_start to valid working day
             new_start = add_business_days(new_start, 0, blocked_dates)
             
             if new_start > t['early_start']:
@@ -187,13 +162,10 @@ def calculate_schedule_dates(tasks_df, project_start_date_str, blocked_dates_jso
                 t['early_finish'] = add_business_days(new_start, t['duration'], blocked_dates)
                 changed = True
     
-    # Finalize
     max_finish = max(t['early_finish'] for t in tasks) if tasks else proj_start
     
     for t in tasks:
         t['start_date'] = t['early_start'].strftime('%Y-%m-%d')
-        # Display end date. Since my logic returns "Start of next day", I should visually show "End of previous day" for Gantt?
-        # Or just keep it continuous. Altair handles ranges fine.
         t['end_date'] = t['early_finish'].strftime('%Y-%m-%d')
         t['is_critical'] = (t['early_finish'] == max_finish)
         
@@ -229,7 +201,6 @@ else:
 @dialog_decorator("Manage Task")
 def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_date):
     selected_task_id = task_id_to_edit
-    # Default start date override to Project Start Date (Smart Default)
     t_data = {'name': "New Task", 'phase': 'Pre-Construction', 'duration': 1, 'start_date_override': project_start_date, 'subcontractor_id': 0, 'dependencies': "[]"}
 
     if mode == 'edit' and selected_task_id is None:
@@ -272,7 +243,6 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_da
         c1, c2 = st.columns(2)
         dur = c1.number_input("Duration (Days)", value=t_data['duration'], min_value=1)
         
-        # Handle Date Input format
         d_val = None
         if t_data['start_date_override']:
             try: d_val = datetime.datetime.strptime(str(t_data['start_date_override']), '%Y-%m-%d').date()
@@ -426,13 +396,13 @@ if st.session_state.page == "Dashboard":
     pid = int(curr_proj['id'])
     p_blocked = curr_proj.get('non_working_days', '[]')
     
-    # LAUNCH PROJECT BUTTON
+    # LAUNCH PROJECT
     c_launch, c_dummy = st.columns([1, 4])
     if c_launch.button("🚀 Launch Project (Reset Start)"):
         st.session_state.active_popup = 'launch_project'
         st.rerun()
 
-    # Calc Stats
+    # Load Data
     tasks_raw = run_query("SELECT * FROM tasks WHERE project_id=:pid", {"pid": pid})
     tasks = calculate_schedule_dates(tasks_raw, curr_proj['start_date'], p_blocked)
     delays = run_query("SELECT * FROM delay_events WHERE project_id=:pid", {"pid": pid})
@@ -440,38 +410,87 @@ if st.session_state.page == "Dashboard":
     if tasks.empty:
         st.warning("No tasks in this project yet.")
     else:
-        final_date = pd.to_datetime(tasks['end_date']).max().strftime('%b %d, %Y')
-        total_delay_days = delays['days_lost'].sum() if not delays.empty else 0
-        tasks_ahead = len(tasks[tasks['variance'] < 0]) if 'variance' in tasks.columns else 0
+        # --- TABS FOR VIEW ---
+        tab_dash, tab_wbs = st.tabs(["📊 Dashboard Overview", "📋 WBS View"])
         
-        c1, c2, c3 = st.columns(3)
-        c1.markdown(f"""<div class="metric-card"><div class="metric-value">{final_date}</div><div class="metric-label">Projected Completion</div></div>""", unsafe_allow_html=True)
-        c2.markdown(f"""<div class="metric-card"><div class="metric-value">{total_delay_days} Days</div><div class="metric-label">Total Delays Logged</div></div>""", unsafe_allow_html=True)
-        c3.markdown(f"""<div class="metric-card"><div class="metric-value" style="color:green">{tasks_ahead}</div><div class="metric-label">Tasks Ahead of Schedule</div></div>""", unsafe_allow_html=True)
+        with tab_dash:
+            final_date = pd.to_datetime(tasks['end_date']).max().strftime('%b %d, %Y')
+            total_delay_days = delays['days_lost'].sum() if not delays.empty else 0
+            tasks_ahead = len(tasks[tasks['variance'] < 0]) if 'variance' in tasks.columns else 0
+            
+            c1, c2, c3 = st.columns(3)
+            c1.markdown(f"""<div class="metric-card"><div class="metric-value">{final_date}</div><div class="metric-label">Projected Completion</div></div>""", unsafe_allow_html=True)
+            c2.markdown(f"""<div class="metric-card"><div class="metric-value">{total_delay_days} Days</div><div class="metric-label">Total Delays Logged</div></div>""", unsafe_allow_html=True)
+            c3.markdown(f"""<div class="metric-card"><div class="metric-value" style="color:green">{tasks_ahead}</div><div class="metric-label">Tasks Ahead of Schedule</div></div>""", unsafe_allow_html=True)
 
-        st.subheader("⚠️ Delay Analysis")
-        if not delays.empty:
-            dc1, dc2 = st.columns([1, 2])
-            with dc1:
-                d_chart = alt.Chart(delays).mark_arc(innerRadius=50).encode(
-                    theta=alt.Theta("days_lost", stack=True), color=alt.Color("reason"), tooltip=["reason", "days_lost"])
-                st.altair_chart(d_chart, use_container_width=True)
-            with dc2:
-                st.dataframe(delays[['event_date', 'reason', 'days_lost', 'description']], use_container_width=True, hide_index=True)
-        else: st.success("No delays recorded for this project!")
+            st.subheader("⚠️ Delay Analysis")
+            if not delays.empty:
+                dc1, dc2 = st.columns([1, 2])
+                with dc1:
+                    d_chart = alt.Chart(delays).mark_arc(innerRadius=50).encode(
+                        theta=alt.Theta("days_lost", stack=True), color=alt.Color("reason"), tooltip=["reason", "days_lost"])
+                    st.altair_chart(d_chart, use_container_width=True)
+                with dc2:
+                    st.dataframe(delays[['event_date', 'reason', 'days_lost', 'description']], use_container_width=True, hide_index=True)
+            else: st.success("No delays recorded for this project!")
 
-        st.subheader("💡 Smart Suggestions")
-        critical_tasks = tasks[tasks['is_critical'] == True]
-        slack_tasks = tasks[tasks['is_critical'] == False]
-        if not critical_tasks.empty and not slack_tasks.empty:
-            crit_start_min = pd.to_datetime(critical_tasks['start_date']).min()
-            crit_end_max = pd.to_datetime(critical_tasks['end_date']).max()
-            resources_available = slack_tasks[(pd.to_datetime(slack_tasks['start_date']) >= crit_start_min) & (pd.to_datetime(slack_tasks['end_date']) <= crit_end_max)]
-            if not resources_available.empty:
-                st.markdown('<div class="suggestion-box"><strong>Resource Reallocation Opportunity:</strong><br>Consider moving crew from these slack tasks to the Critical Path:</div>', unsafe_allow_html=True)
-                for _, row in resources_available.iterrows(): st.write(f"- Move from **{row['name']}**")
-            else: st.info("No obvious reallocations found.")
-        else: st.info("Add more tasks for suggestions.")
+            st.subheader("💡 Smart Suggestions")
+            critical_tasks = tasks[tasks['is_critical'] == True]
+            slack_tasks = tasks[tasks['is_critical'] == False]
+            if not critical_tasks.empty and not slack_tasks.empty:
+                crit_start_min = pd.to_datetime(critical_tasks['start_date']).min()
+                crit_end_max = pd.to_datetime(critical_tasks['end_date']).max()
+                resources_available = slack_tasks[(pd.to_datetime(slack_tasks['start_date']) >= crit_start_min) & (pd.to_datetime(slack_tasks['end_date']) <= crit_end_max)]
+                if not resources_available.empty:
+                    st.markdown('<div class="suggestion-box"><strong>Resource Reallocation Opportunity:</strong><br>Consider moving crew from these slack tasks to the Critical Path:</div>', unsafe_allow_html=True)
+                    for _, row in resources_available.iterrows(): st.write(f"- Move from **{row['name']}**")
+                else: st.info("No obvious reallocations found.")
+            else: st.info("Add more tasks for suggestions.")
+
+        with tab_wbs:
+            st.subheader("Work Breakdown Structure (WBS)")
+            # 1. Define Phase Map
+            PHASE_ORDER = {
+                "Pre-Construction": 1, 
+                "Site Work": 2, 
+                "Foundation": 3, 
+                "Framing": 4,
+                "Exterior Building": 5, 
+                "Interior Building": 6, 
+                "Paving & Parking": 7,
+                "Final Systems and Testing": 8, 
+                "Punchlist & Closeout": 9
+            }
+            
+            # 2. Sort & Assign
+            # Assign '99' to phases not in the map so they drop to bottom
+            tasks['wbs_major'] = tasks['phase'].map(PHASE_ORDER).fillna(99).astype(int)
+            
+            # Sort by Major Phase, then Start Date
+            tasks = tasks.sort_values(by=['wbs_major', 'start_date'])
+            
+            # Generate WBS X.XX
+            wbs_list = []
+            phase_counters = {} # {1: 0, 2: 0...}
+            
+            for _, row in tasks.iterrows():
+                major = row['wbs_major']
+                if major not in phase_counters: phase_counters[major] = 0
+                phase_counters[major] += 1
+                
+                # Format: 1.01, 1.02...
+                sub = phase_counters[major]
+                wbs_str = f"{major}.{sub:02d}"
+                wbs_list.append(wbs_str)
+            
+            tasks['WBS ID'] = wbs_list
+            
+            # Display Table
+            st.dataframe(
+                tasks[['WBS ID', 'phase', 'name', 'duration', 'start_date', 'end_date']],
+                use_container_width=True,
+                hide_index=True
+            )
 
     # POPUP: Launch
     if st.session_state.active_popup == 'launch_project':
@@ -506,7 +525,6 @@ elif st.session_state.page == "Scheduler":
     curr_proj = projs[projs['name'] == sel_p_name].iloc[0]
     pid = int(curr_proj['id'])
     
-    # --- BLOCKED DATES & SETTINGS ---
     p_blocked_json = curr_proj.get('non_working_days', '[]')
     try: p_blocked_list = json.loads(p_blocked_json)
     except: p_blocked_list = []
@@ -543,7 +561,6 @@ elif st.session_state.page == "Scheduler":
                     p_blocked_list.append(str(new_hol))
                     execute_statement("UPDATE projects SET non_working_days=:nw WHERE id=:id", {"nw": json.dumps(p_blocked_list), "id": pid})
                     st.success("Added!"); time.sleep(0.5); st.rerun()
-            
             if p_blocked_list:
                 st.write("**Blocked Dates:**")
                 for bd in p_blocked_list:
@@ -570,7 +587,13 @@ elif st.session_state.page == "Scheduler":
         tasks['Color'] = tasks.apply(lambda x: '#DAA520' if x.get('is_critical') else '#2B588D', axis=1)
         base = alt.Chart(tasks).mark_bar(cornerRadius=5).encode(
             x='start_date:T', x2='end_date:T', y='name:N', row='phase:N', color=alt.Color('Color', scale=None),
-            tooltip=['phase', 'name', 'duration', 'start_date', 'end_date']
+            tooltip=[
+                alt.Tooltip('phase', title='Phase'),
+                alt.Tooltip('name', title='Task'),
+                alt.Tooltip('start_date', format='%b %d, %Y', title='Start'),
+                alt.Tooltip('end_date', format='%b %d, %Y', title='End'),
+                alt.Tooltip('duration', title='Days')
+            ]
         ).interactive()
         
         delays = run_query("SELECT * FROM delay_events WHERE project_id=:pid", {"pid": pid})
