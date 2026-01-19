@@ -1,8 +1,8 @@
 streamlit
 pandas
 sqlalchemy
-psycopg2-binary
 altair
 extra-streamlit-components
+psycopg2-binary
+fpdf2
 matplotlib
-Pillow
