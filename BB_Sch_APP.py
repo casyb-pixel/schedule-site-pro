@@ -85,8 +85,8 @@ def init_db():
         conn.execute(text("CREATE TABLE IF NOT EXISTS task_library (id SERIAL PRIMARY KEY, contractor_type TEXT, phase TEXT, task_name TEXT)"))
         conn.execute(text("CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, project_id INTEGER, phase TEXT, name TEXT, duration INTEGER, start_date_override TEXT, exposure TEXT DEFAULT 'Outdoor', material_lead_time INTEGER DEFAULT 0, material_status TEXT DEFAULT 'Not Ordered', inspection_required INTEGER DEFAULT 0, percent_complete INTEGER DEFAULT 0, dependencies TEXT, subcontractor_id INTEGER, baseline_start_date TEXT, baseline_end_date TEXT)"))
         
-        # Migrations
-        for col in ['material_status', 'exposure', 'baseline_start_date', 'baseline_end_date', 'material_vendor', 'material_po', 'material_notes']:
+        # Migrations - UPDATE: Added material_order_date
+        for col in ['material_status', 'exposure', 'baseline_start_date', 'baseline_end_date', 'material_vendor', 'material_po', 'material_notes', 'material_order_date']:
             try: conn.execute(text(f"ALTER TABLE tasks ADD COLUMN {col} TEXT"))
             except: pass
         for col in ['material_lead_time', 'inspection_required', 'percent_complete']:
@@ -219,7 +219,6 @@ else:
 @dialog_decorator("Manage Task")
 def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_date):
     selected_task_id = task_id_to_edit
-    # Initialize t_data with defaults. 'material_status' defaults to 'Not Ordered'
     t_data = {'name': "New Task", 'phase': 'Pre-Construction', 'duration': 1, 'start_date_override': project_start_date, 'subcontractor_id': 0, 'dependencies': "[]", 'exposure': 'Outdoor', 'material_lead_time': 0, 'material_status': 'Not Ordered', 'inspection_required': 0, 'percent_complete': 0}
 
     if mode == 'edit' and selected_task_id is None:
@@ -304,8 +303,7 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_da
             ph = sel_phase if sel_phase != "Custom" else "General"
             insp_int = 1 if insp else 0
             
-            # --- NEW LOGIC: Default status to 'Delivered' if lead_time is 0 ---
-            # If lead_time > 0, preserve existing status or default to 'Not Ordered'
+            # Smart status logic
             current_stat = t_data.get('material_status')
             if not current_stat: current_stat = 'Not Ordered'
             
@@ -511,7 +509,7 @@ if st.session_state.page == "Dashboard":
                 status = t.get('material_status')
                 if not status or status == 'None': status = 'Not Ordered'
                 
-                # Filter out Delivered/Ordered
+                # Exclude if already ordered/delivered
                 if lead > 0 and status not in ['Ordered', 'Delivered', 'Installed', 'N/A']:
                     start_dt = pd.to_datetime(t['start_date']).date()
                     must_order_by = start_dt - datetime.timedelta(days=lead)
@@ -565,15 +563,18 @@ if st.session_state.page == "Dashboard":
             t_name = run_query("SELECT name FROM tasks WHERE id=:id", {"id": tid}).iloc[0]['name']
             st.write(f"**Task:** {t_name}")
             with st.form("ord_f"):
+                # --- UPDATE: Added Date Field ---
+                ord_date = st.date_input("Date Ordered", value=datetime.date.today())
                 vend = st.text_input("Vendor / Supplier")
                 po = st.text_input("PO Number")
                 notes = st.text_area("Notes / Communication")
                 if st.form_submit_button("✅ Confirm Order"):
+                    # --- UPDATE: Saving Order Date to DB ---
                     execute_statement("""
                         UPDATE tasks 
-                        SET material_status='Ordered', material_vendor=:v, material_po=:p, material_notes=:n 
+                        SET material_status='Ordered', material_vendor=:v, material_po=:p, material_notes=:n, material_order_date=:d 
                         WHERE id=:id
-                    """, {"v": vend, "p": po, "n": notes, "id": tid})
+                    """, {"v": vend, "p": po, "n": notes, "d": str(ord_date), "id": tid})
                     st.success("Updated!"); st.session_state.active_popup = None; st.rerun()
         order_popup(target_tid)
 
@@ -606,6 +607,7 @@ elif st.session_state.page == "Scheduler":
     tasks = calculate_schedule_dates(tasks, curr_proj['start_date'], p_blocked)
     
     if not tasks.empty:
+        # --- COLOR LOGIC: Green for 100%, Gold for Critical, Blue for Std ---
         def get_color(row):
             if row.get('percent_complete', 0) == 100: return '#28a745' 
             if row.get('is_critical'): return '#DAA520' 
@@ -613,6 +615,7 @@ elif st.session_state.page == "Scheduler":
             
         tasks['Color'] = tasks.apply(get_color, axis=1)
         
+        # Chart
         PHASE_ORDER = ["Pre-Construction", "Site Work", "Foundation", "Framing", "Exterior Building", "Interior Building", "Paving & Parking", "Final Systems and Testing", "Punchlist & Closeout"]
         p_map = {p: i for i, p in enumerate(PHASE_ORDER)}
         tasks['phase_order'] = tasks['phase'].map(p_map).fillna(99)
@@ -636,6 +639,7 @@ elif st.session_state.page == "Scheduler":
         st.altair_chart(base, use_container_width=True)
         st.caption("Green = Complete. Gold = Critical Path. Blue = Standard Task.")
 
+        # Table
         editor_df = tasks[['id', 'phase', 'name', 'start_date', 'end_date', 'percent_complete']].copy()
         edited_df = st.data_editor(
             editor_df,
