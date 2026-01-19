@@ -219,6 +219,7 @@ else:
 @dialog_decorator("Manage Task")
 def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_date):
     selected_task_id = task_id_to_edit
+    # Initialize t_data with defaults. 'material_status' defaults to 'Not Ordered'
     t_data = {'name': "New Task", 'phase': 'Pre-Construction', 'duration': 1, 'start_date_override': project_start_date, 'subcontractor_id': 0, 'dependencies': "[]", 'exposure': 'Outdoor', 'material_lead_time': 0, 'material_status': 'Not Ordered', 'inspection_required': 0, 'percent_complete': 0}
 
     if mode == 'edit' and selected_task_id is None:
@@ -303,12 +304,22 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_da
             ph = sel_phase if sel_phase != "Custom" else "General"
             insp_int = 1 if insp else 0
             
-            if selected_task_id:
-                execute_statement("UPDATE tasks SET name=:n, phase=:p, duration=:d, start_date_override=:ov, subcontractor_id=:s, dependencies=:dep, exposure=:ex, material_lead_time=:mlt, inspection_required=:ir, percent_complete=:pc WHERE id=:id",
-                    {"n": new_name, "p": ph, "d": dur, "ov": ov, "s": sub_id, "dep": dep_j, "ex": exposure, "mlt": lead_time, "ir": insp_int, "pc": pct, "id": selected_task_id})
+            # --- NEW LOGIC: Default status to 'Delivered' if lead_time is 0 ---
+            # If lead_time > 0, preserve existing status or default to 'Not Ordered'
+            current_stat = t_data.get('material_status')
+            if not current_stat: current_stat = 'Not Ordered'
+            
+            if lead_time == 0:
+                final_mat_status = 'Delivered'
             else:
-                execute_statement("INSERT INTO tasks (project_id, name, phase, duration, start_date_override, subcontractor_id, dependencies, exposure, material_lead_time, inspection_required, percent_complete) VALUES (:pid, :n, :p, :d, :ov, :s, :dep, :ex, :mlt, :ir, :pc)",
-                    {"pid": project_id, "n": new_name, "p": ph, "d": dur, "ov": ov, "s": sub_id, "dep": dep_j, "ex": exposure, "mlt": lead_time, "ir": insp_int, "pc": pct})
+                final_mat_status = current_stat
+
+            if selected_task_id:
+                execute_statement("UPDATE tasks SET name=:n, phase=:p, duration=:d, start_date_override=:ov, subcontractor_id=:s, dependencies=:dep, exposure=:ex, material_lead_time=:mlt, material_status=:ms, inspection_required=:ir, percent_complete=:pc WHERE id=:id",
+                    {"n": new_name, "p": ph, "d": dur, "ov": ov, "s": sub_id, "dep": dep_j, "ex": exposure, "mlt": lead_time, "ms": final_mat_status, "ir": insp_int, "pc": pct, "id": selected_task_id})
+            else:
+                execute_statement("INSERT INTO tasks (project_id, name, phase, duration, start_date_override, subcontractor_id, dependencies, exposure, material_lead_time, material_status, inspection_required, percent_complete) VALUES (:pid, :n, :p, :d, :ov, :s, :dep, :ex, :mlt, :ms, :ir, :pc)",
+                    {"pid": project_id, "n": new_name, "p": ph, "d": dur, "ov": ov, "s": sub_id, "dep": dep_j, "ex": exposure, "mlt": lead_time, "ms": final_mat_status, "ir": insp_int, "pc": pct})
             st.session_state.active_popup = None; st.rerun()
 
     if selected_task_id and st.button("✅ Mark 100% Complete"):
@@ -423,7 +434,7 @@ with st.sidebar:
         if COOKIE_MANAGER_AVAILABLE: cm.delete("bb_user")
         st.session_state.clear(); st.rerun()
 
-    # --- UPDATE: SIMULATION DATE ---
+    # --- SIMULATION DATE ---
     st.divider()
     sim_date = st.date_input("📆 Simulation Date", value=datetime.date.today(), help="Use this to test alerts for future project dates.")
 
@@ -470,17 +481,12 @@ if st.session_state.page == "Dashboard":
                 tooltip=["Status", "Duration"]
             ).properties(title="Project Progress (Time Allocated)")
 
-            # --- UPDATE: HIGH LEVEL VARIANCE CHART (BY PHASE) ---
-            # Calculate Max Variance per Phase
+            # Chart 2: HIGH LEVEL VARIANCE CHART (BY PHASE)
             PHASE_ORDER = ["Pre-Construction", "Site Work", "Foundation", "Framing", "Exterior Building", "Interior Building", "Paving & Parking", "Final Systems and Testing", "Punchlist & Closeout"]
-            
-            # Ensure phase ordering
             tasks['phase_idx'] = tasks['phase'].apply(lambda x: PHASE_ORDER.index(x) if x in PHASE_ORDER else 99)
             
-            # Group by phase to get the 'worst case' variance for that phase
             phase_var = tasks.groupby(['phase', 'phase_idx'])['variance'].max().reset_index()
             phase_var = phase_var.sort_values('phase_idx')
-            
             phase_var['color'] = phase_var['variance'].apply(lambda x: '#d9534f' if x > 0 else '#28a745')
             
             var_chart = alt.Chart(phase_var).mark_bar().encode(
@@ -496,7 +502,7 @@ if st.session_state.page == "Dashboard":
             
             st.divider()
 
-            # --- UPDATED ALERT LOGIC USING SIMULATION DATE ---
+            # --- ALERT LOGIC (with Simulation Date) ---
             st.subheader(f"⚠️ Action Required (As of {sim_date})")
             
             alerts_found = False
@@ -505,12 +511,11 @@ if st.session_state.page == "Dashboard":
                 status = t.get('material_status')
                 if not status or status == 'None': status = 'Not Ordered'
                 
-                # Exclude if already ordered/delivered
+                # Filter out Delivered/Ordered
                 if lead > 0 and status not in ['Ordered', 'Delivered', 'Installed', 'N/A']:
                     start_dt = pd.to_datetime(t['start_date']).date()
                     must_order_by = start_dt - datetime.timedelta(days=lead)
                     
-                    # USE SIM_DATE for comparison
                     days_until_drop_dead = (must_order_by - sim_date).days
                     
                     alert_html = None
@@ -601,7 +606,6 @@ elif st.session_state.page == "Scheduler":
     tasks = calculate_schedule_dates(tasks, curr_proj['start_date'], p_blocked)
     
     if not tasks.empty:
-        # --- COLOR LOGIC: Green for 100%, Gold for Critical, Blue for Std ---
         def get_color(row):
             if row.get('percent_complete', 0) == 100: return '#28a745' 
             if row.get('is_critical'): return '#DAA520' 
@@ -609,7 +613,6 @@ elif st.session_state.page == "Scheduler":
             
         tasks['Color'] = tasks.apply(get_color, axis=1)
         
-        # Chart
         PHASE_ORDER = ["Pre-Construction", "Site Work", "Foundation", "Framing", "Exterior Building", "Interior Building", "Paving & Parking", "Final Systems and Testing", "Punchlist & Closeout"]
         p_map = {p: i for i, p in enumerate(PHASE_ORDER)}
         tasks['phase_order'] = tasks['phase'].map(p_map).fillna(99)
@@ -633,7 +636,6 @@ elif st.session_state.page == "Scheduler":
         st.altair_chart(base, use_container_width=True)
         st.caption("Green = Complete. Gold = Critical Path. Blue = Standard Task.")
 
-        # Table
         editor_df = tasks[['id', 'phase', 'name', 'start_date', 'end_date', 'percent_complete']].copy()
         edited_df = st.data_editor(
             editor_df,
