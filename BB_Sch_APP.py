@@ -221,23 +221,17 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_da
     selected_task_id = task_id_to_edit
     t_data = {'name': "New Task", 'phase': 'Pre-Construction', 'duration': 1, 'start_date_override': project_start_date, 'subcontractor_id': 0, 'dependencies': "[]", 'exposure': 'Outdoor', 'material_lead_time': 0, 'material_status': 'Not Ordered', 'inspection_required': 0, 'percent_complete': 0}
 
-    # --- FIX 1: CALCULATE DATES BEFORE SORTING ---
     if mode == 'edit' and selected_task_id is None:
-        # Get RAW tasks
         all_tasks_raw = run_query("SELECT * FROM tasks WHERE project_id=:pid", {"pid": project_id})
         
         if all_tasks_raw.empty:
             st.warning("No tasks to edit.")
             return
 
-        # Calculate dates in Python so we have 'start_date'
-        # We need the blocked dates for accuracy, fetch them quickly
         pj_q = run_query("SELECT non_working_days FROM projects WHERE id=:pid", {"pid": project_id})
         blocked = pj_q.iloc[0]['non_working_days'] if not pj_q.empty else "[]"
         
         all_tasks_calc = calculate_schedule_dates(all_tasks_raw, project_start_date, blocked)
-        
-        # Now we can sort by the calculated 'start_date'
         all_tasks_calc = all_tasks_calc.sort_values(by=['start_date', 'id'])
         
         t_options = {row['id']: f"{row['start_date']} | {row['name']}" for _, row in all_tasks_calc.iterrows()}
@@ -323,11 +317,9 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_da
 
 @dialog_decorator("Log Delay")
 def delay_popup(project_id, project_start_date, blocked_dates_json):
-    # --- FIX: TWO-STEP WIZARD ---
     if 'delay_step' not in st.session_state: st.session_state.delay_step = 1
     if 'delay_temp' not in st.session_state: st.session_state.delay_temp = {}
 
-    # STEP 1: GATHER INFO
     if st.session_state.delay_step == 1:
         st.write("### Step 1: Delay Details")
         with st.form("d_step1"):
@@ -335,21 +327,16 @@ def delay_popup(project_id, project_start_date, blocked_dates_json):
             d_reason = st.selectbox("Reason", ["Weather", "Material", "Inspection", "Other"])
             d_days = st.number_input("Days Lost", min_value=1, value=1)
             d_notes = st.text_area("Notes")
-            
             if st.form_submit_button("Next: Find Affected Tasks"):
-                st.session_state.delay_temp = {
-                    'date': d_date, 'reason': d_reason, 'days': d_days, 'notes': d_notes
-                }
+                st.session_state.delay_temp = {'date': d_date, 'reason': d_reason, 'days': d_days, 'notes': d_notes}
                 st.session_state.delay_step = 2
                 st.rerun()
 
-    # STEP 2: SELECT TASKS (Based on Date from Step 1)
     if st.session_state.delay_step == 2:
         st.write("### Step 2: Select Affected Tasks")
         dt_val = st.session_state.delay_temp['date']
         st.write(f"Showing tasks active on: **{dt_val}**")
 
-        # Query and Calculate
         tasks_raw = run_query("SELECT * FROM tasks WHERE project_id=:pid", {"pid": project_id})
         tasks = calculate_schedule_dates(tasks_raw, project_start_date, blocked_dates_json)
         
@@ -364,7 +351,6 @@ def delay_popup(project_id, project_start_date, blocked_dates_json):
         with st.form("d_step2"):
             aff = st.multiselect("Select Tasks to Push", options=t_opts.keys(), format_func=lambda x: t_opts[x])
             
-            # Mitigation Check
             mitigation = False
             override = False
             if st.session_state.delay_temp['reason'] == "Weather" and aff:
@@ -377,31 +363,21 @@ def delay_popup(project_id, project_start_date, blocked_dates_json):
                     for _, r in indoor.iterrows(): st.write(f"- {r['name']}")
                     override = st.checkbox("Force Delay (Ignore Mitigation)")
 
-            c_back, c_sub = st.columns([1, 1])
-            # Note: Buttons inside forms act as submits. We use logic to distinguish.
-            # Actually, standard Streamlit forms don't support multiple buttons nicely. 
-            # We will just have Confirm here and a 'Cancel' outside.
-            
             if st.form_submit_button("✅ Confirm Delay"):
                 if not aff: st.error("Please select at least one task.")
                 elif mitigation and not override: st.error("Please review mitigation options above.")
                 else:
-                    # Save
                     meta = st.session_state.delay_temp
                     execute_statement("INSERT INTO delay_events (project_id, reason, days_lost, affected_task_ids, event_date, description) VALUES (:pid, :r, :d, :a, :date, :desc)",
                         {"pid": project_id, "r": meta['reason'], "d": meta['days'], "a": json.dumps(aff), "date": str(meta['date']), "desc": meta['notes']})
                     for tid in aff:
                         execute_statement("UPDATE tasks SET duration = duration + :d WHERE id=:tid", {"d": meta['days'], "tid": tid})
-                    
-                    # Reset State
                     del st.session_state.delay_step
                     del st.session_state.delay_temp
-                    st.session_state.active_popup = None
-                    st.rerun()
+                    st.session_state.active_popup = None; st.rerun()
 
         if st.button("⬅️ Back"):
-            st.session_state.delay_step = 1
-            st.rerun()
+            st.session_state.delay_step = 1; st.rerun()
 
 # --- 7. AUTH & MAIN ---
 if 'user_id' not in st.session_state: st.session_state.user_id = None
@@ -447,6 +423,10 @@ with st.sidebar:
         if COOKIE_MANAGER_AVAILABLE: cm.delete("bb_user")
         st.session_state.clear(); st.rerun()
 
+    # --- UPDATE: SIMULATION DATE ---
+    st.divider()
+    sim_date = st.date_input("📆 Simulation Date", value=datetime.date.today(), help="Use this to test alerts for future project dates.")
+
 if st.session_state.page == "Dashboard":
     st.title("Command Center")
     projs = run_query("SELECT * FROM projects WHERE user_id=:u ORDER BY id DESC", {"u": st.session_state.user_id})
@@ -471,7 +451,6 @@ if st.session_state.page == "Dashboard":
             c1.markdown(f"<div class='metric-card'><div class='metric-value'>{final_date}</div><div class='metric-label'>Completion</div></div>", unsafe_allow_html=True)
             c2.markdown(f"<div class='metric-card'><div class='metric-value'>{len(tasks[tasks['variance']<0])}</div><div class='metric-label'>Tasks Ahead</div></div>", unsafe_allow_html=True)
             
-            # --- VISUALIZATIONS ---
             st.divider()
             
             # Chart 1: Progress Pie Chart
@@ -491,15 +470,25 @@ if st.session_state.page == "Dashboard":
                 tooltip=["Status", "Duration"]
             ).properties(title="Project Progress (Time Allocated)")
 
-            # Chart 2: Baseline vs Actual (Variance)
-            tasks['variance_color'] = tasks['variance'].apply(lambda x: '#d9534f' if x > 0 else '#28a745') 
+            # --- UPDATE: HIGH LEVEL VARIANCE CHART (BY PHASE) ---
+            # Calculate Max Variance per Phase
+            PHASE_ORDER = ["Pre-Construction", "Site Work", "Foundation", "Framing", "Exterior Building", "Interior Building", "Paving & Parking", "Final Systems and Testing", "Punchlist & Closeout"]
             
-            var_chart = alt.Chart(tasks).mark_bar().encode(
-                x=alt.X('name:N', sort=None, title='Task'),
-                y=alt.Y('variance:Q', title='Days Variance (Positive = Delayed)'),
-                color=alt.Color('variance_color', scale=None),
-                tooltip=['name', 'variance']
-            ).properties(title="Schedule Variance vs Baseline")
+            # Ensure phase ordering
+            tasks['phase_idx'] = tasks['phase'].apply(lambda x: PHASE_ORDER.index(x) if x in PHASE_ORDER else 99)
+            
+            # Group by phase to get the 'worst case' variance for that phase
+            phase_var = tasks.groupby(['phase', 'phase_idx'])['variance'].max().reset_index()
+            phase_var = phase_var.sort_values('phase_idx')
+            
+            phase_var['color'] = phase_var['variance'].apply(lambda x: '#d9534f' if x > 0 else '#28a745')
+            
+            var_chart = alt.Chart(phase_var).mark_bar().encode(
+                x=alt.X('phase:N', sort=None, title='Phase', axis=alt.Axis(labelAngle=-45)),
+                y=alt.Y('variance:Q', title='Days Behind (-) / Ahead (+)'),
+                color=alt.Color('color', scale=None),
+                tooltip=['phase', 'variance']
+            ).properties(title="Schedule Variance by Phase")
 
             vc1, vc2 = st.columns(2)
             vc1.altair_chart(pie_chart, use_container_width=True)
@@ -507,27 +496,27 @@ if st.session_state.page == "Dashboard":
             
             st.divider()
 
-            # --- MATERIAL ALERTS LOGIC (Robust) ---
-            st.subheader("⚠️ Action Required")
-            today = datetime.date.today()
+            # --- UPDATED ALERT LOGIC USING SIMULATION DATE ---
+            st.subheader(f"⚠️ Action Required (As of {sim_date})")
             
             alerts_found = False
             for _, t in tasks.iterrows():
-                # FIX: Handle NULLs or Empty Strings safely
                 lead = t.get('material_lead_time') or 0
                 status = t.get('material_status')
-                if not status: status = 'Not Ordered'
+                if not status or status == 'None': status = 'Not Ordered'
                 
-                if lead > 0 and status == 'Not Ordered':
+                # Exclude if already ordered/delivered
+                if lead > 0 and status not in ['Ordered', 'Delivered', 'Installed', 'N/A']:
                     start_dt = pd.to_datetime(t['start_date']).date()
                     must_order_by = start_dt - datetime.timedelta(days=lead)
-                    days_overdue = (today - must_order_by).days
+                    
+                    # USE SIM_DATE for comparison
+                    days_until_drop_dead = (must_order_by - sim_date).days
                     
                     alert_html = None
-                    if today >= must_order_by:
+                    if sim_date >= must_order_by:
                         alert_html = f"<div class='alert-red'>🔴 JEOPARDY: '{t['name']}' - Order IMMEDIATELY (Need {lead} days, starts {t['start_date']}).</div>"
-                    elif today >= (must_order_by - datetime.timedelta(days=14)):
-                        days_until_drop_dead = (must_order_by - today).days
+                    elif sim_date >= (must_order_by - datetime.timedelta(days=14)):
                         alert_html = f"<div class='alert-yellow'>🟡 WARNING: '{t['name']}' - Order by {must_order_by} ({days_until_drop_dead} days left).</div>"
                     
                     if alert_html:
@@ -555,7 +544,6 @@ if st.session_state.page == "Dashboard":
             tasks['WBS ID'] = wbs
             st.dataframe(tasks[['WBS ID', 'phase', 'name', 'duration', 'start_date', 'end_date', 'percent_complete', 'material_status']], use_container_width=True, hide_index=True)
 
-    # --- POPUP: LAUNCH ---
     if st.session_state.active_popup == 'launch_project':
         @dialog_decorator("🚀 Launch Project")
         def launch_popup():
@@ -565,7 +553,6 @@ if st.session_state.page == "Dashboard":
                 st.success("Launched!"); st.session_state.active_popup = None; st.rerun()
         launch_popup()
 
-    # --- POPUP: ORDER MATERIAL ---
     if isinstance(st.session_state.active_popup, tuple) and st.session_state.active_popup[0] == 'order_mat':
         target_tid = st.session_state.active_popup[1]
         @dialog_decorator("📦 Mark Material Ordered")
@@ -614,11 +601,11 @@ elif st.session_state.page == "Scheduler":
     tasks = calculate_schedule_dates(tasks, curr_proj['start_date'], p_blocked)
     
     if not tasks.empty:
-        # --- FIX 2: GREEN COLOR FOR 100% COMPLETE ---
+        # --- COLOR LOGIC: Green for 100%, Gold for Critical, Blue for Std ---
         def get_color(row):
-            if row.get('percent_complete', 0) == 100: return '#28a745' # Green
-            if row.get('is_critical'): return '#DAA520' # Gold
-            return '#2B588D' # Blue
+            if row.get('percent_complete', 0) == 100: return '#28a745' 
+            if row.get('is_critical'): return '#DAA520' 
+            return '#2B588D' 
             
         tasks['Color'] = tasks.apply(get_color, axis=1)
         
@@ -646,7 +633,7 @@ elif st.session_state.page == "Scheduler":
         st.altair_chart(base, use_container_width=True)
         st.caption("Green = Complete. Gold = Critical Path. Blue = Standard Task.")
 
-        # --- FIX 2: ENABLE EDITING BY USING NUMBER COLUMN ---
+        # Table
         editor_df = tasks[['id', 'phase', 'name', 'start_date', 'end_date', 'percent_complete']].copy()
         edited_df = st.data_editor(
             editor_df,
@@ -659,7 +646,6 @@ elif st.session_state.page == "Scheduler":
                 "name": st.column_config.TextColumn("Task Name", disabled=True),
                 "start_date": st.column_config.DateColumn("Start", disabled=True),
                 "end_date": st.column_config.DateColumn("End", disabled=True),
-                # Using NumberColumn allows direct editing
                 "percent_complete": st.column_config.NumberColumn(
                     "% Done", 
                     min_value=0, 
