@@ -21,52 +21,7 @@ try:
 except ImportError:
     COOKIE_MANAGER_AVAILABLE = False
 
-# --- 2. MASTER LIBRARY (The "Source of Truth") ---
-# Format: (Type, Phase, Task Name)
-# Type can be: 'All', 'Residential', 'Commercial'
-MASTER_LIBRARY = [
-    # PRE-CONSTRUCTION
-    ("All", "Pre-Construction", "Obtain Permits & Approvals"),
-    ("All", "Pre-Construction", "Site Survey & Soil Testing"),
-    ("All", "Pre-Construction", "Finalize Blueprints"),
-    ("All", "Pre-Construction", "Secure Insurance & Bonds"),
-    # SITE WORK
-    ("All", "Site Work", "Clearing & Grubbing"),
-    ("All", "Site Work", "Erosion Control Setup"),
-    ("All", "Site Work", "Rough Grading"),
-    ("All", "Site Work", "Utility Trenching"),
-    # FOUNDATION
-    ("All", "Foundation", "Excavate Footings"),
-    ("All", "Foundation", "Form & Pour Footings"),
-    ("All", "Foundation", "Install Rebar"),
-    ("All", "Foundation", "Pour Concrete Slab/Walls"),
-    ("All", "Foundation", "Waterproofing"),
-    # STRUCTURE (The Split)
-    ("Residential", "Structure", "First Floor Framing"),
-    ("Residential", "Structure", "Second Floor Framing"),
-    ("Residential", "Structure", "Roof Trusses & Sheathing"),
-    ("Commercial", "Structure", "Steel Erection"),
-    ("Commercial", "Structure", "Concrete Superstructure"),
-    ("All", "Structure", "Install Windows & Exterior Doors"),
-    # MEP
-    ("All", "MEP Rough-In", "Plumbing Rough-In"),
-    ("All", "MEP Rough-In", "Electrical Rough-In"),
-    ("All", "MEP Rough-In", "HVAC Ductwork"),
-    ("Commercial", "MEP Rough-In", "Fire Sprinkler Rough-In"),
-    ("All", "MEP Rough-In", "Low Voltage Wiring"),
-    # INTERIOR
-    ("All", "Interiors", "Insulation Install"),
-    ("All", "Interiors", "Hang Drywall"),
-    ("All", "Interiors", "Tape & Finish Drywall"),
-    ("All", "Interiors", "Interior Painting"),
-    ("All", "Interiors", "Flooring Install"),
-    # FINISHES
-    ("All", "Finishes", "Cabinetry & Millwork"),
-    ("All", "Finishes", "Install Fixtures (Elec/Plumb)"),
-    ("All", "Finishes", "Punch List Walkthrough")
-]
-
-# --- 3. CSS STYLING ---
+# --- 2. CSS STYLING ---
 st.markdown("""
     <style>
     .stApp { background-color: #f4f6f9; color: #000000 !important; }
@@ -82,7 +37,7 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- 4. DATABASE ENGINE ---
+# --- 3. DATABASE ENGINE ---
 @st.cache_resource
 def get_engine():
     try:
@@ -112,7 +67,7 @@ def execute_statement(query, params=None):
         st.error(f"Database Error: {e}")
         return None
 
-# --- 5. DB INIT (Safe) ---
+# --- 4. DB INIT (Safe) ---
 def init_db():
     with engine.begin() as conn:
         conn.execute(text("CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username TEXT UNIQUE, password TEXT, email TEXT, created_at TEXT, company_name TEXT, scheduler_status TEXT DEFAULT 'Trial')"))
@@ -122,7 +77,7 @@ def init_db():
         conn.execute(text("CREATE TABLE IF NOT EXISTS task_library (id SERIAL PRIMARY KEY, contractor_type TEXT, phase TEXT, task_name TEXT)"))
         conn.execute(text("CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, project_id INTEGER, phase TEXT, name TEXT, duration INTEGER, start_date_override TEXT, exposure TEXT DEFAULT 'Outdoor', material_lead_time INTEGER DEFAULT 0, inspection_required INTEGER DEFAULT 0, dependencies TEXT, subcontractor_id INTEGER)"))
         
-        # Migrations for existing DBs
+        # Attempt Auto-Migration (Silent)
         try: conn.execute(text("ALTER TABLE tasks ADD COLUMN phase TEXT"))
         except: pass
         try: conn.execute(text("ALTER TABLE projects ADD COLUMN project_type TEXT DEFAULT 'Residential'"))
@@ -130,7 +85,7 @@ def init_db():
 
 init_db()
 
-# --- 6. LOGIC ---
+# --- 5. LOGIC ---
 def calculate_schedule_dates(tasks_df, project_start_date_str):
     if tasks_df.empty: return tasks_df
     tasks = tasks_df.to_dict('records')
@@ -173,7 +128,7 @@ def calculate_schedule_dates(tasks_df, project_start_date_str):
             
     return pd.DataFrame(tasks)
 
-# --- 7. POPUPS ---
+# --- 6. POPUPS ---
 if hasattr(st, 'dialog'): dialog_decorator = st.dialog
 elif hasattr(st, 'experimental_dialog'): dialog_decorator = st.experimental_dialog
 else:
@@ -195,11 +150,15 @@ def edit_task_popup(task_id, project_id, user_id):
         if not q.empty: t_data = q.iloc[0]
 
     # --- FETCH PROJECT TYPE FOR FILTERING ---
-    p_q = run_query("SELECT project_type FROM projects WHERE id=:pid", {"pid": project_id})
-    p_type = p_q.iloc[0]['project_type'] if not p_q.empty else 'Residential'
+    # We check if column exists first to be safe
+    try:
+        p_q = run_query("SELECT project_type FROM projects WHERE id=:pid", {"pid": project_id})
+        p_type = p_q.iloc[0]['project_type'] if not p_q.empty else 'Residential'
+    except:
+        p_type = 'Residential' # Fallback if DB column missing
 
     # --- SELECTORS ---
-    # Filter library by project type (include 'All')
+    # 1. FETCH FROM SUPABASE task_library TABLE (No hardcoded list)
     lib_df = run_query(
         "SELECT * FROM task_library WHERE contractor_type IN ('All', :pt)", 
         {"pt": p_type}
@@ -208,8 +167,8 @@ def edit_task_popup(task_id, project_id, user_id):
     phases = sorted(lib_df['phase'].unique().tolist()) if not lib_df.empty else []
     
     if not phases:
-        st.error("⚠️ Task Library is empty! Go to Settings -> Scroll Down -> Click 'Force-Reload Task Library'")
-        return
+        st.error("⚠️ Your 'task_library' table in Supabase is empty! Add tasks there to see them here.")
+        # No return, allow Custom entry
 
     c_ph, c_tk = st.columns(2)
     
@@ -305,7 +264,7 @@ def delay_popup(project_id):
             execute_statement("DELETE FROM delay_events WHERE id=:id", {"id": d['id']})
             st.rerun()
 
-# --- 8. AUTH & MAIN ---
+# --- 7. AUTH & MAIN ---
 if 'user_id' not in st.session_state: st.session_state.user_id = None
 if 'active_popup' not in st.session_state: st.session_state.active_popup = None
 if 'editing_id' not in st.session_state: st.session_state.editing_id = None
@@ -357,7 +316,12 @@ if st.session_state.page == "Dashboard":
     st.metric("Total Projects", proj_count)
     st.subheader("Your Projects")
     projs = run_query("SELECT * FROM projects WHERE user_id=:u ORDER BY id DESC", {"u": st.session_state.user_id})
-    if not projs.empty: st.dataframe(projs[['name', 'client_name', 'project_type', 'start_date']], use_container_width=True)
+    if not projs.empty:
+        # SAFE COLUMN SELECTION to prevent crash if 'project_type' is missing
+        cols_to_show = ['name', 'client_name', 'start_date']
+        if 'project_type' in projs.columns:
+            cols_to_show.insert(2, 'project_type')
+        st.dataframe(projs[cols_to_show], use_container_width=True)
 
 elif st.session_state.page == "New Project":
     st.title("Create Project")
@@ -365,9 +329,13 @@ elif st.session_state.page == "New Project":
         n = st.text_input("Name"); c = st.text_input("Client"); s = st.date_input("Start")
         pt = st.selectbox("Project Type", ["Residential", "Commercial"])
         if st.form_submit_button("Create", type="primary"):
-            execute_statement("INSERT INTO projects (user_id, name, client_name, start_date, project_type) VALUES (:u, :n, :c, :s, :pt)", 
-                {"u": st.session_state.user_id, "n": n, "c": c, "s": str(s), "pt": pt})
-            st.session_state.page = "Scheduler"; st.rerun()
+            # Check if column exists before insert, otherwise fallback
+            try:
+                execute_statement("INSERT INTO projects (user_id, name, client_name, start_date, project_type) VALUES (:u, :n, :c, :s, :pt)", 
+                    {"u": st.session_state.user_id, "n": n, "c": c, "s": str(s), "pt": pt})
+                st.session_state.page = "Scheduler"; st.rerun()
+            except Exception as e:
+                st.error(f"Error creating project: {e}. Please go to Settings -> Fix Database Schema.")
 
 elif st.session_state.page == "Scheduler":
     st.title("Scheduler")
@@ -437,11 +405,13 @@ elif st.session_state.page == "Settings":
 
     st.markdown("---")
     st.subheader("Database Maintenance")
-    st.warning("Only use this if your Task/Phase dropdowns are empty.")
-    if st.button("🚀 Force-Reload Task Library"):
-        with engine.begin() as conn:
-            conn.execute(text("TRUNCATE TABLE task_library RESTART IDENTITY"))
-            for type_, phase, task in MASTER_LIBRARY:
-                conn.execute(text("INSERT INTO task_library (contractor_type, phase, task_name) VALUES (:c, :p, :t)"), 
-                    {"c": type_, "p": phase, "t": task})
-        st.success("Library Repopulated! Go back to Scheduler.")
+    st.info("Run this if your Dashboard crashes or 'Project Type' is missing.")
+    
+    if st.button("🛠️ Fix Database Schema"):
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS project_type TEXT DEFAULT 'Residential'"))
+                conn.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS phase TEXT"))
+            st.success("Schema Repaired! You can now use the Dashboard.")
+        except Exception as e:
+            st.error(f"Migration Failed: {e}. Try running the SQL manually in Supabase.")
