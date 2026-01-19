@@ -34,6 +34,7 @@ st.markdown("""
         border: 1px solid #bee5eb;
     }
     .stButton button { background-color: #2B588D !important; color: white !important; }
+    div[data-testid="stExpander"] details summary p { font-weight: bold; font-size: 1.1em; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -140,13 +141,28 @@ else:
             return inner
         return wrapper
 
-@dialog_decorator("Task Editor")
-def edit_task_popup(task_id, project_id, user_id):
-    is_edit = (task_id is not None)
-    t_data = {'name': "New Task", 'phase': 'Pre-Construction', 'duration': 1, 'start_date_override': None, 'subcontractor_id': 0, 'dependencies': "[]", 'exposure': "Outdoor"}
+@dialog_decorator("Manage Task")
+def edit_task_popup(mode, task_id_to_edit, project_id, user_id):
+    # Mode can be 'new' or 'edit'
+    # If 'edit', we might need to select the task first inside the popup
     
-    if is_edit:
-        q = run_query("SELECT * FROM tasks WHERE id=:id", {"id": task_id})
+    selected_task_id = task_id_to_edit
+    t_data = {'name': "New Task", 'phase': 'Pre-Construction', 'duration': 1, 'start_date_override': None, 'subcontractor_id': 0, 'dependencies': "[]", 'exposure': "Outdoor"}
+
+    # If in edit mode but no ID provided, show a selector
+    if mode == 'edit' and selected_task_id is None:
+        all_tasks = run_query("SELECT id, name, phase FROM tasks WHERE project_id=:pid ORDER BY phase, id", {"pid": project_id})
+        if all_tasks.empty:
+            st.warning("No tasks to edit.")
+            return
+        
+        t_options = {row['id']: f"{row['phase']} - {row['name']}" for _, row in all_tasks.iterrows()}
+        selected_task_id = st.selectbox("Select Task to Edit", options=t_options.keys(), format_func=lambda x: t_options[x])
+        st.divider()
+
+    # Load data if an ID is selected (either passed in or picked above)
+    if selected_task_id:
+        q = run_query("SELECT * FROM tasks WHERE id=:id", {"id": selected_task_id})
         if not q.empty: t_data = q.iloc[0]
 
     # --- FETCH PROJECT TYPE ---
@@ -200,30 +216,36 @@ def edit_task_popup(task_id, project_id, user_id):
         # Dependencies
         all_t = run_query("SELECT id, name FROM tasks WHERE project_id=:pid", {"pid": project_id})
         t_opts = {row['id']: row['name'] for _, row in all_t.iterrows()}
+        
+        # Remove self from dependencies if editing
+        if selected_task_id and selected_task_id in t_opts: del t_opts[selected_task_id]
+
         curr_deps = []
         try: curr_deps = [int(x) for x in json.loads(t_data['dependencies'])]
         except: pass
         deps = st.multiselect("Predecessors", options=t_opts.keys(), format_func=lambda x: t_opts[x], default=[d for d in curr_deps if d in t_opts])
         
         c_save, c_del = st.columns([1,1])
-        save_btn = c_save.form_submit_button("💾 Save", type="primary")
-        del_btn = c_del.form_submit_button("🗑️ Delete")
+        save_btn = c_save.form_submit_button("💾 Save Task", type="primary")
+        del_btn = False
+        if selected_task_id:
+            del_btn = c_del.form_submit_button("🗑️ Delete Task")
         
         if save_btn:
             ov = str(start_ov) if start_ov else None
             dep_j = json.dumps(deps)
             ph = sel_phase if sel_phase != "Custom" else "General"
             
-            if is_edit:
+            if selected_task_id:
                 execute_statement("UPDATE tasks SET name=:n, phase=:p, duration=:d, start_date_override=:ov, subcontractor_id=:s, dependencies=:dep WHERE id=:id",
-                    {"n": new_name, "p": ph, "d": dur, "ov": ov, "s": sub_id, "dep": dep_j, "id": task_id})
+                    {"n": new_name, "p": ph, "d": dur, "ov": ov, "s": sub_id, "dep": dep_j, "id": selected_task_id})
             else:
                 execute_statement("INSERT INTO tasks (project_id, name, phase, duration, start_date_override, subcontractor_id, dependencies) VALUES (:pid, :n, :p, :d, :ov, :s, :dep)",
                     {"pid": project_id, "n": new_name, "p": ph, "d": dur, "ov": ov, "s": sub_id, "dep": dep_j})
             st.session_state.active_popup = None; st.rerun()
             
         if del_btn:
-            if is_edit: execute_statement("DELETE FROM tasks WHERE id=:id", {"id": task_id})
+            execute_statement("DELETE FROM tasks WHERE id=:id", {"id": selected_task_id})
             st.session_state.active_popup = None; st.rerun()
 
     # --- QUICK ADD SUB (Outside Form) ---
@@ -239,7 +261,7 @@ def edit_task_popup(task_id, project_id, user_id):
 
 @dialog_decorator("Log Delay")
 def delay_popup(project_id, project_start_date):
-    # 1. Recalculate Schedule Live to get accurate dates
+    # 1. Recalculate Schedule Live
     tasks_raw = run_query("SELECT * FROM tasks WHERE project_id=:pid", {"pid": project_id})
     tasks = calculate_schedule_dates(tasks_raw, project_start_date)
     
@@ -249,17 +271,14 @@ def delay_popup(project_id, project_start_date):
         
         # 2. Filter tasks: Start <= Date <= End
         if not tasks.empty:
-            # Convert to same type for comparison
             tasks['start_dt'] = pd.to_datetime(tasks['start_date']).dt.date
             tasks['end_dt'] = pd.to_datetime(tasks['end_date']).dt.date
             
             active_mask = (tasks['start_dt'] <= date_input) & (tasks['end_dt'] >= date_input)
             active_tasks = tasks[active_mask]
             
-            # Fallback if no tasks active
             if active_tasks.empty:
-                t_opts = {}
-                st.warning(f"No tasks active on {date_input}. showing all.")
+                st.warning(f"No tasks active on {date_input}. Showing all.")
                 t_opts = {row['id']: row['name'] for _, row in tasks.iterrows()}
             else:
                 t_opts = {row['id']: row['name'] for _, row in active_tasks.iterrows()}
@@ -269,7 +288,7 @@ def delay_popup(project_id, project_start_date):
         reason = st.selectbox("Reason", ["Weather", "Material", "Inspection", "Other"])
         days = st.number_input("Days Lost", min_value=1)
         
-        aff = st.multiselect("Affected Tasks (Active on Date)", options=t_opts.keys(), format_func=lambda x: t_opts[x])
+        aff = st.multiselect("Affected Tasks", options=t_opts.keys(), format_func=lambda x: t_opts[x])
         
         if st.form_submit_button("Save Delay", type="primary"):
             if aff:
@@ -359,7 +378,7 @@ elif st.session_state.page == "New Project":
                     {"u": st.session_state.user_id, "n": n, "c": c, "s": str(s), "pt": pt})
                 st.session_state.page = "Scheduler"; st.rerun()
             except Exception as e:
-                st.error(f"Error creating project: {e}. Please go to Settings -> Fix Database Schema.")
+                st.error(f"Error creating project: {e}.")
 
 elif st.session_state.page == "Scheduler":
     st.title("Scheduler")
@@ -369,26 +388,47 @@ elif st.session_state.page == "Scheduler":
     c1, c2 = st.columns([3, 1])
     sel_p_name = c1.selectbox("Project", projs['name'])
     
-    # Get details for selected project
+    # Get details
     curr_proj = projs[projs['name'] == sel_p_name].iloc[0]
     pid = int(curr_proj['id'])
     
-    # --- EDIT PROJECT EXPANDER ---
-    with st.expander(f"⚙️ Edit Project: {sel_p_name}"):
+    # --- PROJECT SETTINGS (EDIT/DELETE) ---
+    with st.expander(f"⚙️ Project Settings: {sel_p_name}"):
         with st.form("edit_p"):
             en = st.text_input("Project Name", value=curr_proj['name'])
             ec = st.text_input("Client", value=curr_proj['client_name'])
             es = st.date_input("Start Date", value=datetime.datetime.strptime(curr_proj['start_date'], '%Y-%m-%d'))
-            # Safe status check (since column might not exist in old DBs)
             est = st.selectbox("Status", ["Planning", "In Progress", "Completed", "On Hold"])
-            if st.form_submit_button("Update Project"):
+            if st.form_submit_button("Update Project Details"):
                 execute_statement("UPDATE projects SET name=:n, client_name=:c, start_date=:s, status=:st WHERE id=:id",
                     {"n": en, "c": ec, "s": str(es), "st": est, "id": pid})
                 st.success("Project Updated!"); time.sleep(0.5); st.rerun()
 
+        st.markdown("---")
+        # Separate button for deleting to avoid accidental deletes via Enter key
+        if st.button("🗑️ Delete Entire Project", type="secondary", key="del_proj_btn"):
+            execute_statement("DELETE FROM tasks WHERE project_id=:pid", {"pid": pid})
+            execute_statement("DELETE FROM delay_events WHERE project_id=:pid", {"pid": pid})
+            execute_statement("DELETE FROM projects WHERE id=:pid", {"pid": pid})
+            st.success("Project deleted successfully.")
+            time.sleep(1)
+            st.rerun()
+
+    # --- ACTION BUTTONS ---
     with c2:
-        if st.button("➕ Add Task"): st.session_state.active_popup = 'add'; st.session_state.editing_id = None; st.rerun()
-        if st.button("⚠️ Delay"): st.session_state.active_popup = 'delay'; st.rerun()
+        col_new, col_edit = st.columns(2)
+        if col_new.button("➕ Add Task"): 
+            st.session_state.active_popup = 'add_task'
+            st.session_state.editing_id = None
+            st.rerun()
+        if col_edit.button("🖊️ Edit Task"):
+            st.session_state.active_popup = 'edit_task'
+            st.session_state.editing_id = None
+            st.rerun()
+            
+        if st.button("⚠️ Log Delay"): 
+            st.session_state.active_popup = 'delay'
+            st.rerun()
 
     # Data
     tasks = run_query("SELECT * FROM tasks WHERE project_id=:pid", {"pid": pid})
@@ -417,7 +457,6 @@ elif st.session_state.page == "Scheduler":
                         if not t.empty:
                             ds = pd.to_datetime(d['event_date'])
                             de = ds + datetime.timedelta(days=d['days_lost'])
-                            # ALTAIR FIX: Ensure column names match 'base' chart for overlay to work
                             d_rows.append({
                                 'name': t.iloc[0]['name'], 
                                 'phase': t.iloc[0]['phase'], 
@@ -427,7 +466,6 @@ elif st.session_state.page == "Scheduler":
                 except: pass
             
             if d_rows:
-                # Same X/X2/Y/Row encodings as Base
                 over = alt.Chart(pd.DataFrame(d_rows)).mark_bar(color='#D62728', opacity=0.8).encode(
                     x='start_date:T', x2='end_date:T', y='name:N', row='phase:N'
                 )
@@ -442,8 +480,15 @@ elif st.session_state.page == "Scheduler":
             if row['duration'] != orig['duration']:
                 execute_statement("UPDATE tasks SET duration=:d WHERE id=:id", {"d": row['duration'], "id": row['id']}); st.rerun()
 
-    if st.session_state.active_popup == 'add': edit_task_popup(None, pid, st.session_state.user_id)
-    if st.session_state.active_popup == 'delay': delay_popup(pid, curr_proj['start_date'])
+    # --- HANDLERS FOR POPUPS ---
+    if st.session_state.active_popup == 'add_task':
+        edit_task_popup('new', None, pid, st.session_state.user_id)
+        
+    if st.session_state.active_popup == 'edit_task':
+        edit_task_popup('edit', None, pid, st.session_state.user_id)
+        
+    if st.session_state.active_popup == 'delay':
+        delay_popup(pid, curr_proj['start_date'])
 
 elif st.session_state.page == "Settings":
     st.title("Settings")
@@ -455,16 +500,4 @@ elif st.session_state.page == "Settings":
         if st.form_submit_button("Save"):
             execute_statement("UPDATE users SET company_name=:n WHERE id=:u", {"n": cn, "u": st.session_state.user_id})
             st.success("Saved!")
-
-    st.markdown("---")
-    st.subheader("Database Maintenance")
-    st.info("Run this if your Dashboard crashes or 'Project Type' is missing.")
-    
-    if st.button("🛠️ Fix Database Schema"):
-        try:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS project_type TEXT DEFAULT 'Residential'"))
-                conn.execute(text("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS phase TEXT"))
-            st.success("Schema Repaired! You can now use the Dashboard.")
-        except Exception as e:
-            st.error(f"Migration Failed: {e}. Try running the SQL manually in Supabase.")
+            
