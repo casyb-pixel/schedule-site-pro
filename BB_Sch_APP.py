@@ -27,18 +27,24 @@ st.markdown("""
     .stApp { background-color: #f4f6f9; color: #000000 !important; }
     [data-testid="stSidebar"] { background-color: #2B588D; }
     [data-testid="stSidebar"] * { color: white !important; }
+    
+    /* DASHBOARD METRICS */
     .metric-card {
-        background-color: white; padding: 20px; border-radius: 10px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1); text-align: center;
-        border-top: 4px solid #2B588D; margin-bottom: 10px;
+        background-color: white; padding: 20px; border-radius: 12px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.05); text-align: center;
+        border-top: 5px solid #2B588D; margin-bottom: 15px; height: 140px;
+        display: flex; flex-direction: column; justify-content: center;
     }
-    .metric-value { font-size: 2rem; font-weight: bold; color: #2B588D; }
-    .metric-label { font-size: 0.9rem; color: #666; text-transform: uppercase; }
-    .alert-red { background-color: #f8d7da; color: #721c24; padding: 10px; border-radius: 5px; border: 1px solid #f5c6cb; margin-bottom: 10px; font-weight: bold; }
-    .alert-yellow { background-color: #fff3cd; color: #856404; padding: 10px; border-radius: 5px; border: 1px solid #ffeeba; margin-bottom: 10px; font-weight: bold; }
-    .suggestion-box { background-color: #d4edda; color: #155724; padding: 15px; border-radius: 8px; border: 1px solid #c3e6cb; margin-bottom: 10px; }
-    .stButton button { background-color: #2B588D !important; color: white !important; }
-    div[data-testid="stExpander"] details summary p { font-weight: bold; font-size: 1.1em; }
+    .metric-value { font-size: 2.2rem; font-weight: 800; color: #2B588D; }
+    .metric-label { font-size: 0.95rem; color: #555; text-transform: uppercase; letter-spacing: 1px; margin-top: 5px; }
+    
+    /* ALERTS */
+    .alert-red { background-color: #ffebee; color: #c62828; padding: 12px; border-radius: 8px; border-left: 5px solid #c62828; margin-bottom: 8px; font-weight: 500; font-size: 0.9rem; }
+    .alert-yellow { background-color: #fff8e1; color: #f57f17; padding: 12px; border-radius: 8px; border-left: 5px solid #f57f17; margin-bottom: 8px; font-weight: 500; font-size: 0.9rem; }
+    
+    .suggestion-box { background-color: #e8f5e9; color: #2e7d32; padding: 15px; border-radius: 8px; border: 1px solid #c8e6c9; margin-bottom: 10px; }
+    
+    .stButton button { background-color: #2B588D !important; color: white !important; font-weight: bold; border-radius: 6px; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -82,7 +88,7 @@ def init_db():
         conn.execute(text("CREATE TABLE IF NOT EXISTS task_library (id SERIAL PRIMARY KEY, contractor_type TEXT, phase TEXT, task_name TEXT)"))
         conn.execute(text("CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, project_id INTEGER, phase TEXT, name TEXT, duration INTEGER, start_date_override TEXT, exposure TEXT DEFAULT 'Outdoor', material_lead_time INTEGER DEFAULT 0, material_status TEXT DEFAULT 'Not Ordered', inspection_required INTEGER DEFAULT 0, percent_complete INTEGER DEFAULT 0, dependencies TEXT, subcontractor_id INTEGER, baseline_start_date TEXT, baseline_end_date TEXT)"))
         
-        # Migrations
+        # Migrations (Auto-Healing)
         try: conn.execute(text("ALTER TABLE tasks ADD COLUMN material_status TEXT DEFAULT 'Not Ordered'"))
         except: pass
         try: conn.execute(text("ALTER TABLE subcontractors ADD COLUMN phone TEXT"))
@@ -111,10 +117,20 @@ def calculate_schedule_dates(tasks_df, project_start_date_str, blocked_dates_jso
     task_map = {t['id']: t for t in tasks}
     try: blocked_dates = set(json.loads(blocked_dates_json or "[]"))
     except: blocked_dates = set()
-    proj_start = datetime.datetime.strptime(project_start_date_str, '%Y-%m-%d').date()
+    
+    # Robust Date Parsing
+    try:
+        proj_start = pd.to_datetime(project_start_date_str).date()
+    except:
+        proj_start = datetime.date.today()
     
     for t in tasks:
-        base_start = datetime.datetime.strptime(t['start_date_override'], '%Y-%m-%d').date() if t.get('start_date_override') else proj_start
+        # Check Override
+        base_start = proj_start
+        if t.get('start_date_override'):
+            try: base_start = pd.to_datetime(t['start_date_override']).date()
+            except: pass
+            
         t['early_start'] = add_business_days(base_start, 0, blocked_dates)
         t['early_finish'] = add_business_days(t['early_start'], t['duration'], blocked_dates)
         try: t['dep_list'] = [int(x) for x in json.loads(t['dependencies'])]
@@ -140,16 +156,22 @@ def calculate_schedule_dates(tasks_df, project_start_date_str, blocked_dates_jso
                 changed = True
     
     max_finish = max(t['early_finish'] for t in tasks) if tasks else proj_start
+    
     for t in tasks:
         t['start_date'] = t['early_start'].strftime('%Y-%m-%d')
         t['end_date'] = t['early_finish'].strftime('%Y-%m-%d')
         t['is_critical'] = (t['early_finish'] == max_finish)
+        
+        # Variance Calculation (Needs valid baseline)
+        t['variance'] = 0
         if t.get('baseline_end_date'):
             try:
-                base_end = datetime.datetime.strptime(t['baseline_end_date'], '%Y-%m-%d').date()
-                t['variance'] = (t['early_finish'] - base_end).days
-            except: t['variance'] = 0
-        else: t['variance'] = 0
+                base_end = pd.to_datetime(t['baseline_end_date']).date()
+                curr_end = t['early_finish']
+                # Variance = Actual - Baseline. Positive = Late. Negative = Ahead.
+                t['variance'] = (curr_end - base_end).days
+            except: pass
+            
     return pd.DataFrame(tasks)
 
 def capture_baseline(project_id, tasks_df):
@@ -214,7 +236,7 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_da
         dur = c1.number_input("Duration (Days)", value=t_data['duration'], min_value=1)
         d_val = None
         if t_data['start_date_override']:
-            try: d_val = datetime.datetime.strptime(str(t_data['start_date_override']), '%Y-%m-%d').date()
+            try: d_val = pd.to_datetime(t_data['start_date_override']).date()
             except: d_val = None
         start_ov = c2.date_input("Manual Start (Optional)", value=d_val)
 
@@ -399,9 +421,19 @@ if st.session_state.page == "Dashboard":
         tab_dash, tab_wbs = st.tabs(["📊 Dashboard Overview", "📋 WBS View"])
         with tab_dash:
             final_date = pd.to_datetime(tasks['end_date']).max().strftime('%b %d, %Y')
-            c1, c2 = st.columns(2)
-            c1.markdown(f"<div class='metric-card'><div class='metric-value'>{final_date}</div><div class='metric-label'>Completion</div></div>", unsafe_allow_html=True)
-            c2.markdown(f"<div class='metric-card'><div class='metric-value'>{len(tasks[tasks['variance']<0])}</div><div class='metric-label'>Tasks Ahead</div></div>", unsafe_allow_html=True)
+            
+            # Tasks Ahead: Variance < 0 (requires baseline)
+            tasks_ahead = len(tasks[tasks['variance'] < 0])
+            
+            # Completion % (Average of all tasks)
+            overall_pct = int(tasks['percent_complete'].mean()) if 'percent_complete' in tasks.columns else 0
+            
+            # --- TOP METRICS ROW ---
+            c1, c2, c3 = st.columns(3)
+            c1.markdown(f"<div class='metric-card'><div class='metric-value'>{final_date}</div><div class='metric-label'>Projected Completion</div></div>", unsafe_allow_html=True)
+            c2.markdown(f"<div class='metric-card'><div class='metric-value'>{overall_pct}%</div><div class='metric-label'>Project Progress</div><progress value='{overall_pct}' max='100' style='width:80%; margin:auto'></progress></div>", unsafe_allow_html=True)
+            color = "green" if tasks_ahead > 0 else "#999"
+            c3.markdown(f"<div class='metric-card'><div class='metric-value' style='color:{color}'>{tasks_ahead}</div><div class='metric-label'>Tasks Ahead of Sched.</div></div>", unsafe_allow_html=True)
             
             st.subheader("⚠️ Action Required")
             today = datetime.date.today()
@@ -429,13 +461,10 @@ if st.session_state.page == "Dashboard":
                 st.altair_chart(d_chart, use_container_width=True)
 
         with tab_wbs:
-            # --- PRE-CALCULATE WBS ORDER & ID FOR DISPLAY ---
             PHASE_ORDER = ["Pre-Construction", "Site Work", "Foundation", "Framing", "Exterior Building", "Interior Building", "Paving & Parking", "Final Systems and Testing", "Punchlist & Closeout"]
-            PHASE_MAP = {name: i+1 for i, name in enumerate(PHASE_ORDER)}
-            
-            tasks['wbs_major'] = tasks['phase'].map(PHASE_MAP).fillna(99).astype(int)
+            phase_map = {p: i+1 for i, p in enumerate(PHASE_ORDER)}
+            tasks['wbs_major'] = tasks['phase'].map(phase_map).fillna(99).astype(int)
             tasks = tasks.sort_values(by=['wbs_major', 'start_date'])
-            
             wbs_list = []
             phase_counters = {}
             for _, row in tasks.iterrows():
@@ -484,32 +513,63 @@ elif st.session_state.page == "Scheduler":
     if not tasks.empty:
         tasks['Color'] = tasks.apply(lambda x: '#DAA520' if x.get('is_critical') else '#2B588D', axis=1)
         
-        # --- FIXED CHART VISUALS ---
-        min_start = pd.to_datetime(tasks['start_date']).min()
-        max_end = pd.to_datetime(tasks['end_date']).max()
-        view_min = (min_start - datetime.timedelta(days=5)).strftime('%Y-%m-%d')
-        view_max = (max_end + datetime.timedelta(days=5)).strftime('%Y-%m-%d')
-        
-        # Phase Ordering for Chart
+        # --- PREPARE GANTT DATA (Sorting & Scaling) ---
         PHASE_ORDER = ["Pre-Construction", "Site Work", "Foundation", "Framing", "Exterior Building", "Interior Building", "Paving & Parking", "Final Systems and Testing", "Punchlist & Closeout"]
         
-        base = alt.Chart(tasks).mark_bar(cornerRadius=5).encode(
-            x=alt.X('start_date:T', scale=alt.Scale(domain=[view_min, view_max])),
+        # 1. Force Sorting in Pandas first
+        phase_map = {p: i for i, p in enumerate(PHASE_ORDER)}
+        tasks['phase_order'] = tasks['phase'].map(phase_map).fillna(99)
+        tasks = tasks.sort_values(by=['phase_order', 'start_date'])
+        
+        # 2. Dynamic Height Calculation
+        chart_height = max(400, len(tasks) * 25) # 25px per task
+        
+        # 3. Dynamic X-Axis Domain
+        min_date = pd.to_datetime(tasks['start_date']).min()
+        max_date = pd.to_datetime(tasks['end_date']).max()
+        buffer = datetime.timedelta(days=7)
+        domain = [(min_date - buffer).strftime('%Y-%m-%d'), (max_date + buffer).strftime('%Y-%m-%d')]
+
+        # 4. The Chart
+        base = alt.Chart(tasks).mark_bar(cornerRadius=3, height=15).encode(
+            x=alt.X('start_date:T', scale=alt.Scale(domain=domain), title='Date'),
             x2='end_date:T',
-            y=alt.Y('name:N', sort='x'), # Sort tasks by start date
-            row=alt.Row('phase:N', sort=PHASE_ORDER), # Sort phases by logical order
+            y=alt.Y('name:N', sort=None, title=None), # sort=None respects Pandas sort order
+            row=alt.Row('phase:N', sort=PHASE_ORDER, title="Phase"), # Group by Phase
             color=alt.Color('Color', scale=None),
             tooltip=[
                 alt.Tooltip('phase', title='Phase'),
                 alt.Tooltip('name', title='Task'),
-                alt.Tooltip('start_date', title='Start', format='%b %d, %Y'),
-                alt.Tooltip('end_date', title='End', format='%b %d, %Y'),
+                alt.Tooltip('start_date', title='Start'),
+                alt.Tooltip('end_date', title='End'),
                 alt.Tooltip('duration', title='Days'),
                 alt.Tooltip('percent_complete', title='% Done')
             ]
-        ).interactive()
+        ).properties(height=chart_height).interactive() # Make it taller
+        
         st.altair_chart(base, use_container_width=True)
+        st.caption("Tip: Use mouse wheel to zoom in/out on the timeline.")
+        
+        # Grid
         st.data_editor(tasks[['phase', 'name', 'start_date', 'end_date', 'duration']], hide_index=True, disabled=True)
+
+    with st.expander(f"⚙️ Project Settings: {sel_p_name}"):
+        tab_gen, tab_hol = st.tabs(["General", "Non-Working Days"])
+        with tab_gen:
+            with st.form("edit_p"):
+                en = st.text_input("Project Name", value=curr_proj['name'])
+                ec = st.text_input("Client", value=curr_proj['client_name'])
+                es = st.date_input("Start Date", value=datetime.datetime.strptime(curr_proj['start_date'], '%Y-%m-%d'))
+                if st.form_submit_button("Update"):
+                    execute_statement("UPDATE projects SET name=:n, client_name=:c, start_date=:s WHERE id=:id", {"n": en, "c": ec, "s": str(es), "id": pid}); st.rerun()
+            st.divider()
+            if st.button("📸 Capture Baseline"):
+                capture_baseline(pid, tasks)
+                st.success("Baseline Captured! 'Tasks Ahead' metrics are now active.")
+            if st.button("🗑️ Delete Project", type="secondary"):
+                execute_statement("DELETE FROM tasks WHERE project_id=:pid", {"pid": pid})
+                execute_statement("DELETE FROM projects WHERE id=:pid", {"pid": pid})
+                st.rerun()
 
     if st.session_state.active_popup == 'add_task': edit_task_popup('new', None, pid, st.session_state.user_id, curr_proj['start_date'])
     if st.session_state.active_popup == 'edit_task': edit_task_popup('edit', None, pid, st.session_state.user_id, curr_proj['start_date'])
