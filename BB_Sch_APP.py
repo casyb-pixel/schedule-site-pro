@@ -225,7 +225,6 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_da
         
         mat_opts = ["Not Ordered", "Ordered", "Delivered", "Installed"]
         curr_mat = t_data.get('material_status', 'Not Ordered')
-        # Safety check if column is newly added and possibly NULL
         if curr_mat is None: curr_mat = 'Not Ordered'
         mat_idx = mat_opts.index(curr_mat) if curr_mat in mat_opts else 0
         mat_status = st.selectbox("Material Status", mat_opts, index=mat_idx)
@@ -480,9 +479,29 @@ elif st.session_state.page == "Scheduler":
     
     if not tasks.empty:
         tasks['Color'] = tasks.apply(lambda x: '#DAA520' if x.get('is_critical') else '#2B588D', axis=1)
+        
+        # --- FIXED CHART SCALING & FILTERING ---
+        min_start = pd.to_datetime(tasks['start_date']).min()
+        max_end = pd.to_datetime(tasks['end_date']).max()
+        
+        # Pad dates slightly for visuals
+        view_min = (min_start - datetime.timedelta(days=2)).strftime('%Y-%m-%d')
+        view_max = (max_end + datetime.timedelta(days=2)).strftime('%Y-%m-%d')
+
         base = alt.Chart(tasks).mark_bar(cornerRadius=5).encode(
-            x='start_date:T', x2='end_date:T', y='name:N', row='phase:N', color=alt.Color('Color', scale=None),
-            tooltip=['phase', 'name', 'duration', 'start_date', 'end_date', 'percent_complete']
+            x=alt.X('start_date:T', scale=alt.Scale(domain=[view_min, view_max])),
+            x2='end_date:T',
+            y='name:N',
+            row='phase:N',
+            color=alt.Color('Color', scale=None),
+            tooltip=[
+                alt.Tooltip('phase', title='Phase'),
+                alt.Tooltip('name', title='Task'),
+                alt.Tooltip('start_date', title='Start', format='%Y-%m-%d'),
+                alt.Tooltip('end_date', title='End', format='%Y-%m-%d'),
+                alt.Tooltip('duration', title='Days'),
+                alt.Tooltip('percent_complete', title='% Done')
+            ]
         ).interactive()
         st.altair_chart(base, use_container_width=True)
         st.data_editor(tasks[['phase', 'name', 'start_date', 'end_date', 'duration']], hide_index=True, disabled=True)
