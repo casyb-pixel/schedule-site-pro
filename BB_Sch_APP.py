@@ -38,6 +38,7 @@ st.markdown("""
     .alert-yellow { background-color: #fff3cd; color: #856404; padding: 10px; border-radius: 5px; border: 1px solid #ffeeba; margin-bottom: 10px; font-weight: bold; }
     .suggestion-box { background-color: #d4edda; color: #155724; padding: 15px; border-radius: 8px; border: 1px solid #c3e6cb; margin-bottom: 10px; }
     .stButton button { background-color: #2B588D !important; color: white !important; }
+    div[data-testid="stExpander"] details summary p { font-weight: bold; font-size: 1.1em; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -76,29 +77,13 @@ def init_db():
     with engine.begin() as conn:
         conn.execute(text("CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username TEXT UNIQUE, password TEXT, email TEXT, created_at TEXT, company_name TEXT, scheduler_status TEXT DEFAULT 'Trial')"))
         conn.execute(text("CREATE TABLE IF NOT EXISTS projects (id SERIAL PRIMARY KEY, user_id INTEGER, name TEXT, client_name TEXT, start_date TEXT, status TEXT DEFAULT 'Planning', project_type TEXT DEFAULT 'Residential', non_working_days TEXT DEFAULT '[]')"))
-        # Updated Subcontractors Table
         conn.execute(text("CREATE TABLE IF NOT EXISTS subcontractors (id SERIAL PRIMARY KEY, user_id INTEGER, company_name TEXT, contact_name TEXT, trade TEXT, phone TEXT, email TEXT)"))
         conn.execute(text("CREATE TABLE IF NOT EXISTS delay_events (id SERIAL PRIMARY KEY, project_id INTEGER, reason TEXT, days_lost INTEGER, affected_task_ids TEXT, event_date TEXT, description TEXT)"))
         conn.execute(text("CREATE TABLE IF NOT EXISTS task_library (id SERIAL PRIMARY KEY, contractor_type TEXT, phase TEXT, task_name TEXT)"))
-        # Updated Tasks Table
         conn.execute(text("CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, project_id INTEGER, phase TEXT, name TEXT, duration INTEGER, start_date_override TEXT, exposure TEXT DEFAULT 'Outdoor', material_lead_time INTEGER DEFAULT 0, material_status TEXT DEFAULT 'Not Ordered', inspection_required INTEGER DEFAULT 0, percent_complete INTEGER DEFAULT 0, dependencies TEXT, subcontractor_id INTEGER, baseline_start_date TEXT, baseline_end_date TEXT)"))
         
         # Migrations
-        try: conn.execute(text("ALTER TABLE projects ADD COLUMN non_working_days TEXT DEFAULT '[]'"))
-        except: pass
-        try: conn.execute(text("ALTER TABLE tasks ADD COLUMN baseline_start_date TEXT"))
-        except: pass
-        try: conn.execute(text("ALTER TABLE tasks ADD COLUMN baseline_end_date TEXT"))
-        except: pass
-        try: conn.execute(text("ALTER TABLE tasks ADD COLUMN exposure TEXT DEFAULT 'Outdoor'"))
-        except: pass
-        try: conn.execute(text("ALTER TABLE tasks ADD COLUMN material_lead_time INTEGER DEFAULT 0"))
-        except: pass
         try: conn.execute(text("ALTER TABLE tasks ADD COLUMN material_status TEXT DEFAULT 'Not Ordered'"))
-        except: pass
-        try: conn.execute(text("ALTER TABLE tasks ADD COLUMN inspection_required INTEGER DEFAULT 0"))
-        except: pass
-        try: conn.execute(text("ALTER TABLE tasks ADD COLUMN percent_complete INTEGER DEFAULT 0"))
         except: pass
         try: conn.execute(text("ALTER TABLE subcontractors ADD COLUMN phone TEXT"))
         except: pass
@@ -124,7 +109,7 @@ def calculate_schedule_dates(tasks_df, project_start_date_str, blocked_dates_jso
     if tasks_df.empty: return tasks_df
     tasks = tasks_df.to_dict('records')
     task_map = {t['id']: t for t in tasks}
-    try: blocked_dates = set(json.loads(blocked_dates_json))
+    try: blocked_dates = set(json.loads(blocked_dates_json or "[]"))
     except: blocked_dates = set()
     proj_start = datetime.datetime.strptime(project_start_date_str, '%Y-%m-%d').date()
     
@@ -238,9 +223,10 @@ def edit_task_popup(mode, task_id_to_edit, project_id, user_id, project_start_da
         exposure = c3.selectbox("Exposure", ["Outdoor", "Indoor"], index=exp_idx)
         lead_time = c4.number_input("Material Lead Time (Days)", value=t_data.get('material_lead_time', 0), min_value=0)
         
-        # New: Material Status
         mat_opts = ["Not Ordered", "Ordered", "Delivered", "Installed"]
         curr_mat = t_data.get('material_status', 'Not Ordered')
+        # Safety check if column is newly added and possibly NULL
+        if curr_mat is None: curr_mat = 'Not Ordered'
         mat_idx = mat_opts.index(curr_mat) if curr_mat in mat_opts else 0
         mat_status = st.selectbox("Material Status", mat_opts, index=mat_idx)
 
@@ -327,7 +313,6 @@ def delay_popup(project_id, project_start_date, blocked_dates_json):
         
         mitigation_warning = False
         override_checkbox = False
-        
         if reason == "Weather" and aff:
             affected_subs = tasks[tasks['id'].isin(aff)]['subcontractor_id'].unique()
             affected_subs = [s for s in affected_subs if s != 0]
@@ -484,10 +469,6 @@ elif st.session_state.page == "Scheduler":
     curr_proj = projs[projs['name'] == sel_p_name].iloc[0]
     pid = int(curr_proj['id'])
     p_blocked = curr_proj.get('non_working_days', '[]')
-    
-    with st.expander(f"⚙️ Project Settings: {sel_p_name}"):
-        st.write("Edit Details or Add Non-Working Days here.")
-        # Simplified for brevity in this fix block
     
     with c2:
         if st.button("➕ Add Task"): st.session_state.active_popup = 'add_task'; st.session_state.editing_id = None; st.rerun()
