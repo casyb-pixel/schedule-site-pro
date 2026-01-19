@@ -40,11 +40,10 @@ st.markdown("""
     .alert-red { background-color: #ffebee; color: #c62828; padding: 12px; border-radius: 8px; border-left: 5px solid #c62828; margin-bottom: 8px; font-weight: 500; font-size: 0.9rem; }
     .alert-yellow { background-color: #fff8e1; color: #f57f17; padding: 12px; border-radius: 8px; border-left: 5px solid #f57f17; margin-bottom: 8px; font-weight: 500; font-size: 0.9rem; }
     
-    .suggestion-box { background-color: #e8f5e9; color: #2e7d32; padding: 15px; border-radius: 8px; border: 1px solid #c8e6c9; margin-bottom: 10px; }
     .stButton button { background-color: #2B588D !important; color: white !important; font-weight: bold; border-radius: 6px; }
     
-    /* Chart text fix */
-    text { font-family: sans-serif !important; }
+    /* Make charts text readable */
+    text { font-family: sans-serif !important; font-size: 12px !important; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -173,7 +172,6 @@ def calculate_schedule_dates(tasks_df, project_start_date_str, blocked_dates_jso
 def capture_baseline(project_id, tasks_df):
     if tasks_df.empty: return
     for _, row in tasks_df.iterrows():
-        # Ensure dates are strings for SQL
         s_str = str(row['start_date'])
         e_str = str(row['end_date'])
         execute_statement("UPDATE tasks SET baseline_start_date=:s, baseline_end_date=:e WHERE id=:id", 
@@ -500,6 +498,7 @@ elif st.session_state.page == "Scheduler":
     tasks = calculate_schedule_dates(tasks, curr_proj['start_date'], p_blocked)
     
     if not tasks.empty:
+        # Explicit Colors
         tasks['Color'] = tasks.apply(lambda x: '#DAA520' if x.get('is_critical') else '#2B588D', axis=1)
         
         # --- FIXED CHART VISUALS (Independent Scales + Filtering) ---
@@ -515,18 +514,43 @@ elif st.session_state.page == "Scheduler":
         tasks['phase_order'] = tasks['phase'].map(phase_map).fillna(99)
         tasks = tasks.sort_values(by=['phase_order', 'start_date'])
         
+        # Ensure 'name' is unique per task to avoid aggregation issues in Altair, 
+        # though standard Gantt usually allows duplicate names if they are distinct tasks. 
+        # We use 'id' as a hidden unique identifier if needed, but here simple names are fine.
+        
+        # Dynamic Height
+        chart_height = max(400, len(tasks) * 30)
+
         base = alt.Chart(tasks).mark_bar(cornerRadius=3, height=20).encode(
             x=alt.X('start_date:T', scale=alt.Scale(domain=[view_min, view_max]), title='Date'),
             x2='end_date:T',
-            y=alt.Y('name:N', title=None), 
+            y=alt.Y('name:N', title=None, axis=alt.Axis(labelLimit=300)), # Readable Margins
             color=alt.Color('Color', scale=None),
             tooltip=['phase', 'name', 'start_date', 'end_date']
         ).facet(
-            row=alt.Row('phase:N', sort=PHASE_ORDER, title=None) # Facet by phase
-        ).resolve_scale(y='independent') # THIS FIXES THE JUMBLED/EMPTY ROWS
+            row=alt.Row('phase:N', sort=PHASE_ORDER, title=None, header=alt.Header(labelFontSize=14, labelFontWeight='bold')) # Facet by phase
+        ).resolve_scale(y='independent').properties(bounds='flush') # Fix Jumbled Rows
         
         st.altair_chart(base, use_container_width=True)
         st.data_editor(tasks[['phase', 'name', 'start_date', 'end_date', 'duration']], hide_index=True, disabled=True)
+
+    with st.expander(f"⚙️ Project Settings: {sel_p_name}"):
+        tab_gen, tab_hol = st.tabs(["General", "Non-Working Days"])
+        with tab_gen:
+            with st.form("edit_p"):
+                en = st.text_input("Project Name", value=curr_proj['name'])
+                ec = st.text_input("Client", value=curr_proj['client_name'])
+                es = st.date_input("Start Date", value=datetime.datetime.strptime(curr_proj['start_date'], '%Y-%m-%d'))
+                if st.form_submit_button("Update"):
+                    execute_statement("UPDATE projects SET name=:n, client_name=:c, start_date=:s WHERE id=:id", {"n": en, "c": ec, "s": str(es), "id": pid}); st.rerun()
+            st.divider()
+            if st.button("📸 Capture Baseline"):
+                capture_baseline(pid, tasks)
+                st.success("Baseline Captured! 'Tasks Ahead' metrics are now active.")
+            if st.button("🗑️ Delete Project", type="secondary"):
+                execute_statement("DELETE FROM tasks WHERE project_id=:pid", {"pid": pid})
+                execute_statement("DELETE FROM projects WHERE id=:pid", {"pid": pid})
+                st.rerun()
 
     if st.session_state.active_popup == 'add_task': edit_task_popup('new', None, pid, st.session_state.user_id, curr_proj['start_date'])
     if st.session_state.active_popup == 'edit_task': edit_task_popup('edit', None, pid, st.session_state.user_id, curr_proj['start_date'])
