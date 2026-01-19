@@ -22,45 +22,48 @@ except ImportError:
     COOKIE_MANAGER_AVAILABLE = False
 
 # --- 2. MASTER LIBRARY (The "Source of Truth") ---
-# This list replaces your CSV file. It is safer because it lives inside the code.
+# Format: (Type, Phase, Task Name)
+# Type can be: 'All', 'Residential', 'Commercial'
 MASTER_LIBRARY = [
     # PRE-CONSTRUCTION
-    ("Pre-Construction", "Obtain Permits & Approvals"),
-    ("Pre-Construction", "Site Survey & Soil Testing"),
-    ("Pre-Construction", "Finalize Blueprints"),
-    ("Pre-Construction", "Secure Insurance & Bonds"),
+    ("All", "Pre-Construction", "Obtain Permits & Approvals"),
+    ("All", "Pre-Construction", "Site Survey & Soil Testing"),
+    ("All", "Pre-Construction", "Finalize Blueprints"),
+    ("All", "Pre-Construction", "Secure Insurance & Bonds"),
     # SITE WORK
-    ("Site Work", "Clearing & Grubbing"),
-    ("Site Work", "Erosion Control Setup"),
-    ("Site Work", "Rough Grading"),
-    ("Site Work", "Utility Trenching"),
+    ("All", "Site Work", "Clearing & Grubbing"),
+    ("All", "Site Work", "Erosion Control Setup"),
+    ("All", "Site Work", "Rough Grading"),
+    ("All", "Site Work", "Utility Trenching"),
     # FOUNDATION
-    ("Foundation", "Excavate Footings"),
-    ("Foundation", "Form & Pour Footings"),
-    ("Foundation", "Install Rebar"),
-    ("Foundation", "Pour Concrete Slab/Walls"),
-    ("Foundation", "Waterproofing"),
-    # STRUCTURE
-    ("Structure", "First Floor Framing"),
-    ("Structure", "Second Floor Framing"),
-    ("Structure", "Roof Trusses & Sheathing"),
-    ("Structure", "Install Windows & Exterior Doors"),
-    ("Structure", "Steel Erection (Commercial)"),
+    ("All", "Foundation", "Excavate Footings"),
+    ("All", "Foundation", "Form & Pour Footings"),
+    ("All", "Foundation", "Install Rebar"),
+    ("All", "Foundation", "Pour Concrete Slab/Walls"),
+    ("All", "Foundation", "Waterproofing"),
+    # STRUCTURE (The Split)
+    ("Residential", "Structure", "First Floor Framing"),
+    ("Residential", "Structure", "Second Floor Framing"),
+    ("Residential", "Structure", "Roof Trusses & Sheathing"),
+    ("Commercial", "Structure", "Steel Erection"),
+    ("Commercial", "Structure", "Concrete Superstructure"),
+    ("All", "Structure", "Install Windows & Exterior Doors"),
     # MEP
-    ("MEP Rough-In", "Plumbing Rough-In"),
-    ("MEP Rough-In", "Electrical Rough-In"),
-    ("MEP Rough-In", "HVAC Ductwork"),
-    ("MEP Rough-In", "Low Voltage Wiring"),
+    ("All", "MEP Rough-In", "Plumbing Rough-In"),
+    ("All", "MEP Rough-In", "Electrical Rough-In"),
+    ("All", "MEP Rough-In", "HVAC Ductwork"),
+    ("Commercial", "MEP Rough-In", "Fire Sprinkler Rough-In"),
+    ("All", "MEP Rough-In", "Low Voltage Wiring"),
     # INTERIOR
-    ("Interiors", "Insulation Install"),
-    ("Interiors", "Hang Drywall"),
-    ("Interiors", "Tape & Finish Drywall"),
-    ("Interiors", "Interior Painting"),
-    ("Interiors", "Flooring Install"),
+    ("All", "Interiors", "Insulation Install"),
+    ("All", "Interiors", "Hang Drywall"),
+    ("All", "Interiors", "Tape & Finish Drywall"),
+    ("All", "Interiors", "Interior Painting"),
+    ("All", "Interiors", "Flooring Install"),
     # FINISHES
-    ("Finishes", "Cabinetry & Millwork"),
-    ("Finishes", "Install Fixtures (Elec/Plumb)"),
-    ("Finishes", "Punch List Walkthrough")
+    ("All", "Finishes", "Cabinetry & Millwork"),
+    ("All", "Finishes", "Install Fixtures (Elec/Plumb)"),
+    ("All", "Finishes", "Punch List Walkthrough")
 ]
 
 # --- 3. CSS STYLING ---
@@ -74,12 +77,6 @@ st.markdown("""
         box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 15px;
         border-left: 5px solid #2B588D; color: black !important;
         height: 100%;
-    }
-    .completion-banner {
-        background-color: #d1ecf1; border-color: #bee5eb; color: #0c5460;
-        padding: 15px; border-radius: 8px; text-align: center;
-        font-size: 1.2rem; font-weight: bold; margin-bottom: 20px;
-        border: 1px solid #bee5eb;
     }
     .stButton button { background-color: #2B588D !important; color: white !important; }
     </style>
@@ -118,15 +115,17 @@ def execute_statement(query, params=None):
 # --- 5. DB INIT (Safe) ---
 def init_db():
     with engine.begin() as conn:
-        conn.execute(text("CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username TEXT UNIQUE, password TEXT, email TEXT, created_at TEXT, scheduler_status TEXT DEFAULT 'Trial')"))
-        conn.execute(text("CREATE TABLE IF NOT EXISTS projects (id SERIAL PRIMARY KEY, user_id INTEGER, name TEXT, client_name TEXT, start_date TEXT, status TEXT DEFAULT 'Planning')"))
+        conn.execute(text("CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username TEXT UNIQUE, password TEXT, email TEXT, created_at TEXT, company_name TEXT, scheduler_status TEXT DEFAULT 'Trial')"))
+        conn.execute(text("CREATE TABLE IF NOT EXISTS projects (id SERIAL PRIMARY KEY, user_id INTEGER, name TEXT, client_name TEXT, start_date TEXT, status TEXT DEFAULT 'Planning', project_type TEXT DEFAULT 'Residential')"))
         conn.execute(text("CREATE TABLE IF NOT EXISTS subcontractors (id SERIAL PRIMARY KEY, user_id INTEGER, company_name TEXT, contact_name TEXT, trade TEXT)"))
         conn.execute(text("CREATE TABLE IF NOT EXISTS delay_events (id SERIAL PRIMARY KEY, project_id INTEGER, reason TEXT, days_lost INTEGER, affected_task_ids TEXT, event_date TEXT, description TEXT)"))
         conn.execute(text("CREATE TABLE IF NOT EXISTS task_library (id SERIAL PRIMARY KEY, contractor_type TEXT, phase TEXT, task_name TEXT)"))
         conn.execute(text("CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, project_id INTEGER, phase TEXT, name TEXT, duration INTEGER, start_date_override TEXT, exposure TEXT DEFAULT 'Outdoor', material_lead_time INTEGER DEFAULT 0, inspection_required INTEGER DEFAULT 0, dependencies TEXT, subcontractor_id INTEGER)"))
         
-        # Check for phase column
+        # Migrations for existing DBs
         try: conn.execute(text("ALTER TABLE tasks ADD COLUMN phase TEXT"))
+        except: pass
+        try: conn.execute(text("ALTER TABLE projects ADD COLUMN project_type TEXT DEFAULT 'Residential'"))
         except: pass
 
 init_db()
@@ -195,8 +194,17 @@ def edit_task_popup(task_id, project_id, user_id):
         q = run_query("SELECT * FROM tasks WHERE id=:id", {"id": task_id})
         if not q.empty: t_data = q.iloc[0]
 
+    # --- FETCH PROJECT TYPE FOR FILTERING ---
+    p_q = run_query("SELECT project_type FROM projects WHERE id=:pid", {"pid": project_id})
+    p_type = p_q.iloc[0]['project_type'] if not p_q.empty else 'Residential'
+
     # --- SELECTORS ---
-    lib_df = run_query("SELECT * FROM task_library")
+    # Filter library by project type (include 'All')
+    lib_df = run_query(
+        "SELECT * FROM task_library WHERE contractor_type IN ('All', :pt)", 
+        {"pt": p_type}
+    )
+    
     phases = sorted(lib_df['phase'].unique().tolist()) if not lib_df.empty else []
     
     if not phases:
@@ -349,14 +357,16 @@ if st.session_state.page == "Dashboard":
     st.metric("Total Projects", proj_count)
     st.subheader("Your Projects")
     projs = run_query("SELECT * FROM projects WHERE user_id=:u ORDER BY id DESC", {"u": st.session_state.user_id})
-    if not projs.empty: st.dataframe(projs[['name', 'client_name', 'start_date']], use_container_width=True)
+    if not projs.empty: st.dataframe(projs[['name', 'client_name', 'project_type', 'start_date']], use_container_width=True)
 
 elif st.session_state.page == "New Project":
     st.title("Create Project")
     with st.form("np"):
         n = st.text_input("Name"); c = st.text_input("Client"); s = st.date_input("Start")
+        pt = st.selectbox("Project Type", ["Residential", "Commercial"])
         if st.form_submit_button("Create", type="primary"):
-            execute_statement("INSERT INTO projects (user_id, name, client_name, start_date) VALUES (:u, :n, :c, :s)", {"u": st.session_state.user_id, "n": n, "c": c, "s": str(s)})
+            execute_statement("INSERT INTO projects (user_id, name, client_name, start_date, project_type) VALUES (:u, :n, :c, :s, :pt)", 
+                {"u": st.session_state.user_id, "n": n, "c": c, "s": str(s), "pt": pt})
             st.session_state.page = "Scheduler"; st.rerun()
 
 elif st.session_state.page == "Scheduler":
@@ -431,6 +441,7 @@ elif st.session_state.page == "Settings":
     if st.button("🚀 Force-Reload Task Library"):
         with engine.begin() as conn:
             conn.execute(text("TRUNCATE TABLE task_library RESTART IDENTITY"))
-            for p, t in MASTER_LIBRARY:
-                conn.execute(text("INSERT INTO task_library (contractor_type, phase, task_name) VALUES ('All', :p, :t)"), {"p": p, "t": t})
+            for type_, phase, task in MASTER_LIBRARY:
+                conn.execute(text("INSERT INTO task_library (contractor_type, phase, task_name) VALUES (:c, :p, :t)"), 
+                    {"c": type_, "p": phase, "t": task})
         st.success("Library Repopulated! Go back to Scheduler.")
