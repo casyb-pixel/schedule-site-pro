@@ -85,7 +85,7 @@ def init_db():
         conn.execute(text("CREATE TABLE IF NOT EXISTS task_library (id SERIAL PRIMARY KEY, contractor_type TEXT, phase TEXT, task_name TEXT)"))
         conn.execute(text("CREATE TABLE IF NOT EXISTS tasks (id SERIAL PRIMARY KEY, project_id INTEGER, phase TEXT, name TEXT, duration INTEGER, start_date_override TEXT, exposure TEXT DEFAULT 'Outdoor', material_lead_time INTEGER DEFAULT 0, material_status TEXT DEFAULT 'Not Ordered', inspection_required INTEGER DEFAULT 0, percent_complete INTEGER DEFAULT 0, dependencies TEXT, subcontractor_id INTEGER, baseline_start_date TEXT, baseline_end_date TEXT)"))
         
-        # Migrations - UPDATE: Added material_order_date
+        # Migrations
         for col in ['material_status', 'exposure', 'baseline_start_date', 'baseline_end_date', 'material_vendor', 'material_po', 'material_notes', 'material_order_date']:
             try: conn.execute(text(f"ALTER TABLE tasks ADD COLUMN {col} TEXT"))
             except: pass
@@ -456,9 +456,16 @@ if st.session_state.page == "Dashboard":
         tab_dash, tab_wbs = st.tabs(["📊 Dashboard", "📋 WBS"])
         with tab_dash:
             final_date = pd.to_datetime(tasks['end_date']).max().strftime('%b %d, %Y')
+            
+            # --- METRIC 2: TASKS STARTING IN NEXT 2 WEEKS ---
+            # Using sim_date as the reference point
+            two_weeks_out = sim_date + datetime.timedelta(days=14)
+            tasks['start_dt_obj'] = pd.to_datetime(tasks['start_date']).dt.date
+            upcoming_count = len(tasks[ (tasks['start_dt_obj'] >= sim_date) & (tasks['start_dt_obj'] <= two_weeks_out) ])
+
             c1, c2 = st.columns(2)
             c1.markdown(f"<div class='metric-card'><div class='metric-value'>{final_date}</div><div class='metric-label'>Completion</div></div>", unsafe_allow_html=True)
-            c2.markdown(f"<div class='metric-card'><div class='metric-value'>{len(tasks[tasks['variance']<0])}</div><div class='metric-label'>Tasks Ahead</div></div>", unsafe_allow_html=True)
+            c2.markdown(f"<div class='metric-card'><div class='metric-value'>{upcoming_count}</div><div class='metric-label'>Tasks Starting (2 Wks)</div></div>", unsafe_allow_html=True)
             
             st.divider()
             
@@ -575,7 +582,12 @@ if st.session_state.page == "Dashboard":
                         SET material_status='Ordered', material_vendor=:v, material_po=:p, material_notes=:n, material_order_date=:d 
                         WHERE id=:id
                     """, {"v": vend, "p": po, "n": notes, "d": str(ord_date), "id": tid})
-                    st.success("Updated!"); st.session_state.active_popup = None; st.rerun()
+                    
+                    st.success("Updated!")
+                    st.session_state.active_popup = None
+                    # Clear cache to ensure next query picks up new status
+                    st.cache_resource.clear()
+                    st.rerun()
         order_popup(target_tid)
 
 elif st.session_state.page == "New Project":
