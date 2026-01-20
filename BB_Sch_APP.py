@@ -545,9 +545,10 @@ with st.sidebar:
 
     st.divider()
 
-    sim_date = st.date_input("📆 Simulation Date", value=datetime.date.today(), help="Use this to test alerts for future project dates.")
-
 if st.session_state.page == "Dashboard":
+    # HARDCODED DATE (Replaced the simulation input)
+    sim_date = datetime.date.today()
+
     st.title("Command Center")
     projs = run_query("SELECT * FROM projects WHERE user_id=:u ORDER BY id DESC", {"u": st.session_state.user_id})
     if projs.empty: st.info("No projects."); st.stop()
